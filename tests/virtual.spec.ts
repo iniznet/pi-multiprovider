@@ -25,6 +25,13 @@ import {
   type VirtualProviderConfig,
   type VirtualProviderDependencies,
 } from '../src/index.ts'
+import type { ProviderHeaders } from '@earendil-works/pi-ai'
+
+// pi-ai attaches transformHeaders via ModelsRequestTransforms at the runtime
+// boundary; the test backend handlers observe the merged options object.
+type CapturedOptions = SimpleStreamOptions & {
+  transformHeaders?: (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>
+}
 
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
 
@@ -503,6 +510,109 @@ describe('virtual providers', () => {
       expect(last.error.provider).toBe('pooled')
       expect(last.error.model).toBe('ultra')
     }
+  })
+
+  it('re-applies session-routing headers for the dispatched backend', async () => {
+    // Mirrors the user-facing failure: a virtual model backed by opencode-go
+    // must reach opencode.ai with x-opencode-session, even though pi core
+    // computes those headers from the session model (the virtual identity).
+    const opencodeModel: Model<'test-api'> = {
+      ...modelA,
+      id: 'glm-5.3-flash',
+      name: 'GLM Flash',
+      provider: 'opencode-go',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+    }
+    const config: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{ id: 'ultra', backends: [{ providerId: 'opencode-go', modelId: opencodeModel.id }] }],
+    }
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    for (const integration of createVirtualIntegrations(config)) {
+      service.registerProvider(integration)
+    }
+    const captured: Array<CapturedOptions | undefined> = []
+    const virtual = createVirtualProvider({
+      service,
+      config,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: () =>
+        backend('opencode-go', opencodeModel, (_m, _c, options) => {
+          captured.push(options as CapturedOptions | undefined)
+          return okStream('x')
+        }),
+      resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
+    })
+    await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(captured[0]?.transformHeaders).toBeDefined()
+    const headers = await captured[0]!.transformHeaders!({ 'user-agent': 'test' })
+    expect(headers['x-opencode-session']).toBe('session-1')
+    expect(headers['x-opencode-client']).toBe('pi')
+    expect(headers['user-agent']).toBe('test')
+  })
+
+  it('leaves non-session-routing backends untouched', async () => {
+    const config: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: modelA.id }] }],
+    }
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    for (const integration of createVirtualIntegrations(config)) {
+      service.registerProvider(integration)
+    }
+    const captured: Array<CapturedOptions | undefined> = []
+    const virtual = createVirtualProvider({
+      service,
+      config,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: () =>
+        backend('prov-a', modelA, (_m, _c, options) => {
+          captured.push(options as CapturedOptions | undefined)
+          return okStream('x')
+        }),
+      resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
+    })
+    await collect(virtual.stream(virtual.getModels()[0]!, context))
+    const headers = (await captured[0]!.transformHeaders!({})) ?? {}
+    expect(headers['x-opencode-session']).toBeUndefined()
+    expect(headers['x-opencode-client']).toBeUndefined()
+  })
+
+  it('never overrides session-routing headers set upstream', async () => {
+    const opencodeModel: Model<'test-api'> = {
+      ...modelA,
+      id: 'glm-5.3-flash',
+      provider: 'opencode-go',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+    }
+    const config: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{ id: 'ultra', backends: [{ providerId: 'opencode-go', modelId: opencodeModel.id }] }],
+    }
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    for (const integration of createVirtualIntegrations(config)) {
+      service.registerProvider(integration)
+    }
+    const captured: Array<CapturedOptions | undefined> = []
+    const virtual = createVirtualProvider({
+      service,
+      config,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: () =>
+        backend('opencode-go', opencodeModel, (_m, _c, options) => {
+          captured.push(options as CapturedOptions | undefined)
+          return okStream('x')
+        }),
+      resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
+    })
+    await collect(virtual.stream(virtual.getModels()[0]!, context))
+    const headers: ProviderHeaders = await captured[0]!.transformHeaders!({
+      'x-opencode-session': 'pinned-elsewhere',
+    })
+    expect(headers['x-opencode-session']).toBe('pinned-elsewhere')
   })
 
   it('reports placeholder auth once a backend is configured', async () => {

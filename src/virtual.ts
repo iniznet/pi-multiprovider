@@ -18,6 +18,7 @@ import {
   replayTerminal,
   type BufferedTerminal,
 } from './lift.ts'
+import { sessionAttributionHeaders } from './session-attribution.ts'
 import type { MultiProviderService } from './service.ts'
 import type {
   AccountLease,
@@ -246,6 +247,26 @@ function virtualStream<TApi extends Api>(
             await onResponse?.(nextResponse, responseModel)
           }
           attemptOptions.maxRetries = 0
+
+          // Session-routing headers: pi core attributes them from the session
+          // model — the virtual identity here — so a backend dispatched by the
+          // virtual stream would miss them (opencode.ai rejects such requests
+          // with 400 MissingSessionID). Re-apply them for the model actually
+          // dispatched, filling only what the core pipeline and provider hooks
+          // left unset. For virtual integrations the affinity key is the pi
+          // session id.
+          type HeaderTransform = (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>
+          const innerTransformHeaders = attemptOptions.transformHeaders as HeaderTransform | undefined
+          attemptOptions.transformHeaders = async (requestHeaders: ProviderHeaders) => {
+            const attributed = (await innerTransformHeaders?.(requestHeaders)) ?? requestHeaders
+            const enriched: ProviderHeaders = { ...attributed }
+            for (const [name, value] of Object.entries(
+              sessionAttributionHeaders(streamModel, dependencies.getAffinityKey()),
+            )) {
+              if (enriched[name] === undefined || enriched[name] === null) enriched[name] = value
+            }
+            return enriched
+          }
 
           // Same-account tolerance: pre-output retryable errors are absorbed
           // on the current backend until errorsBeforeSwitch is reached, so a

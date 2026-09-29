@@ -1,4 +1,5 @@
 export * from './types.ts'
+export { sessionAttributionHeaders } from './session-attribution.ts'
 export * from './errors.ts'
 export * from './service.ts'
 export { liftProvider } from './lift.ts'
