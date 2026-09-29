@@ -162,6 +162,19 @@ function virtualStream<TApi extends Api>(
     let lastTerminal: BufferedTerminal | undefined
     let lastSetupError: unknown
 
+    // Stable identity: the host selected the virtual model, so every yielded
+    // assistant frame must attribute to the virtual provider/model — not the
+    // backing provider that happened to serve the attempt. Consumers compare
+    // this attribution against the selected model (session transcript, resume,
+    // pi-fabric's model drift guard) and treating a mismatch as drift.
+    const attributeEvent = (event: AssistantMessageEvent): AssistantMessageEvent => {
+      const identity = { provider: config.id, model: model.id }
+      if ('partial' in event) return { ...event, partial: { ...event.partial, ...identity } }
+      if (event.type === 'done') return { ...event, message: { ...event.message, ...identity } }
+      if (event.type === 'error') return { ...event, error: { ...event.error, ...identity } }
+      return event
+    }
+
     const attemptsStream = (async function* (): AsyncGenerator<AssistantMessageEvent> {
       while (attempts < maxAttempts) {
         let lease: AccountLease<VirtualBackend>
@@ -245,7 +258,8 @@ function virtualStream<TApi extends Api>(
               : target.provider.stream(streamModel, context, attemptOptions as ApiStreamOptions<Api>)
 
             let retriedSameAccount = false
-            for await (const event of inner) {
+            for await (const raw of inner) {
+              const event = attributeEvent(raw)
               if (event.type === 'start') {
                 start = event
                 continue

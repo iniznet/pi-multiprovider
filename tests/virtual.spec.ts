@@ -453,6 +453,58 @@ describe('virtual providers', () => {
     ).resolves.toBeUndefined()
   })
 
+  it('attributes every yielded frame to the virtual model identity', async () => {
+    const { virtual } = harness({ a: () => okStream('from-a'), b: () => okStream('from-b') })
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.length).toBeGreaterThan(0)
+    for (const event of events) {
+      if ('partial' in event) {
+        expect(event.partial.provider).toBe('pooled')
+        expect(event.partial.model).toBe('ultra')
+      }
+      if (event.type === 'done') {
+        expect(event.message.provider).toBe('pooled')
+        expect(event.message.model).toBe('ultra')
+      }
+    }
+  })
+
+  it('attributes failover frames to the virtual identity across backends', async () => {
+    const { virtual } = harness(
+      { a: () => errorStream('HTTP 500'), b: () => okStream('from-b') },
+      undefined,
+      { errorsBeforeSwitch: 1 },
+    )
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    const done = events.at(-1)!
+    if (done.type === 'done') {
+      expect(done.message.provider).toBe('pooled')
+      expect(done.message.model).toBe('ultra')
+    }
+    for (const event of events) {
+      if ('partial' in event) {
+        expect(event.partial.provider).toBe('pooled')
+        expect(event.partial.model).toBe('ultra')
+      }
+    }
+  })
+
+  it('attributes replayed terminal errors to the virtual identity', async () => {
+    const { virtual } = harness(
+      { a: () => errorStream('HTTP 500'), b: () => errorStream('HTTP 503') },
+      undefined,
+      { errorsBeforeSwitch: 1 },
+    )
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    const last = events.at(-1)!
+    expect(last).toMatchObject({ type: 'error' })
+    if (last.type === 'error') {
+      expect(last.error.provider).toBe('pooled')
+      expect(last.error.model).toBe('ultra')
+    }
+  })
+
   it('reports placeholder auth once a backend is configured', async () => {
     const { virtual } = harness({ a: () => okStream('x'), b: () => okStream('x') })
     const resolution = await virtual.auth.apiKey!.resolve({

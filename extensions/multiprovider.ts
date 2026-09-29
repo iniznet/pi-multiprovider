@@ -1286,14 +1286,28 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         ? undefined
         : (await service.snapshot()).providers.find(candidate => candidate.id === poolId)
       const accounts = pool?.accounts ?? []
-      if (integration === undefined || pool === undefined || accounts.length === 0) {
-        ctx.ui.notify(`${providerName} has no pooled accounts. Use /multilogin to add one.`, 'info')
-        return
-      }
       // The upstream account is excluded from attempts while Pi has no
       // credential configured for it, so pinning it then would never apply.
       const upstreamConfigured = probeSessionRuntime(ctx)
         ?.getProviderAuthStatus(providerId)?.configured !== false
+      if (integration === undefined) {
+        // No stored pool exists: ambient auth (Pi /login, auth.json,
+        // environment) still resolves per request, there is just nothing to
+        // switch between. Say so instead of implying auth is broken.
+        ctx.ui.notify(
+          `${providerName} has no multiprovider pool. ${
+            upstreamConfigured
+              ? 'Its ambient credential (Pi /login, auth.json, or environment) is used directly.'
+              : 'No ambient credential is configured either.'
+          } Run /multilogin ${poolId} to add pooled accounts.`,
+          'info',
+        )
+        return
+      }
+      if (pool === undefined || accounts.length === 0) {
+        ctx.ui.notify(`${providerName} has an empty pool. Use /multilogin to add one.`, 'info')
+        return
+      }
       const switchable = accounts.filter(account =>
         account.id !== PI_UPSTREAM_ACCOUNT_ID || upstreamConfigured)
       if (switchable.length === 0) {
