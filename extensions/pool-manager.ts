@@ -12,6 +12,7 @@ import {
   SCHEDULER_DEFAULTS,
   SCHEDULER_SETTING_KEYS,
   type SchedulerSettings,
+  SELECTION_POLICIES,
   type SelectionPolicy,
 } from '../src/index.ts'
 import {
@@ -60,13 +61,6 @@ export type PoolManagerResult =
   | { type: 'closed' }
   | { type: 'add'; method: string }
   | { type: 'reauth'; accountId: string; method: string }
-
-const POLICIES: readonly SelectionPolicy[] = [
-  'round-robin',
-  'weighted-round-robin',
-  'least-inflight',
-  'priority',
-]
 
 const REMOVE_SENTINEL = '__remove__'
 const ADD_SENTINEL_PREFIX = '__add__:'
@@ -395,7 +389,7 @@ function buildView(
   const items: SettingItem[] = [
     setting('pool.policy', 'Strategy', state.policy, {
       description: 'How the pool picks the next account for each request.',
-      values: POLICIES,
+      values: SELECTION_POLICIES,
     }),
     setting('pool.affinity', 'Session affinity', state.affinity ? 'true' : 'false', {
       description: 'Keep a healthy account pinned to this session instead of re-selecting on every request.',

@@ -35,6 +35,7 @@ import {
   type ProviderRegistration,
   type PublicAccountSnapshot,
   type SchedulerSettingsPatch,
+  SELECTION_POLICIES,
   type SelectionPolicy,
   type SessionPin,
   type VirtualModelTemplate,
@@ -118,7 +119,7 @@ type EditorPage =
   | { kind: 'provider-picker' }
   | { kind: 'model-picker' }
   | { kind: 'backend' }
-  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' }
+  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -267,14 +268,17 @@ class VirtualProviderEditorDialog extends Container {
 
   private buildMenu(): void {
     const model = this.draft!.models[0]!
+    const strategy = this.draft!.strategy ?? 'round-robin'
     const items: SettingItem[] = [
       this.menuItem('model-id', `Model id: ${model.id}`),
+      this.menuItem('strategy', `Strategy: ${strategy}`),
       this.menuItem('add', 'Add backing provider model'),
       this.separatorItem('sep-top'),
       ...model.backends.map((backend, index) => this.menuItem(
         `backend-${index}`,
         `${index + 1}. ${backend.providerId}`
-          + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`),
+          + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`
+            + (backend.priority === undefined ? '' : ` · p${backend.priority}`)),
       )),
       this.separatorItem('sep-bottom'),
       this.menuItem('save', 'Save and apply'),
@@ -289,6 +293,13 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = model.id
           this.goTo({ kind: 'input', purpose: 'model-id' })
+        } else if (id === 'strategy') {
+          // Cycle the persisted pool strategy; round-robin keeps the virtual
+          // pool's unbiased rotation, the others map onto pool scheduling.
+          const current = this.draft!.strategy ?? 'round-robin'
+          const next = SELECTION_POLICIES[(SELECTION_POLICIES.indexOf(current) + 1) % SELECTION_POLICIES.length]!
+          this.draft!.strategy = next
+          this.goTo({ kind: 'menu' })
         } else if (id === 'add') {
           this.goTo({ kind: 'provider-picker' })
         } else if (id === 'save') {
@@ -383,6 +394,7 @@ class VirtualProviderEditorDialog extends Container {
     const items: SettingItem[] = [
       this.menuItem('toggle', backend.enabled === false ? 'Enable' : 'Disable'),
       this.menuItem('weight', 'Set weight'),
+      this.menuItem('priority', `Set priority (lower runs first · now ${backend.priority ?? 0})`),
       this.menuItem('remove', 'Remove'),
     ]
     this.attachList(
@@ -396,6 +408,10 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = String(backend.weight ?? 1)
           this.goTo({ kind: 'input', purpose: 'weight' })
+        } else if (id === 'priority') {
+          this.inputBackPage = { kind: 'backend' }
+          this.inputInitial = String(backend.priority ?? 0)
+          this.goTo({ kind: 'input', purpose: 'priority' })
         } else if (id === 'remove') {
           this.draft!.models[0]!.backends.splice(this.activeBackendIndex, 1)
         } else return
@@ -409,11 +425,15 @@ class VirtualProviderEditorDialog extends Container {
     const purpose = this.page.kind === 'input' ? this.page.purpose : 'model-id'
     const title = purpose === 'provider-id'
       ? 'Virtual provider id'
-      : purpose === 'model-id' ? 'Virtual model id (shown in /model)' : 'Set weight'
+      : purpose === 'model-id'
+      ? 'Virtual model id (shown in /model)'
+      : purpose === 'priority' ? 'Set priority (lower runs first)' : 'Set weight'
     this.addHeading(title, 'Enter confirms · Esc goes back.')
     const input = new Input()
     input.setValue(this.inputInitial)
-    input.onSubmit = () => this.applyInput(purpose, input.getValue())
+    input.onSubmit = () => purpose === 'priority'
+      ? this.applyPriorityInput(input.getValue())
+      : this.applyInput(purpose, input.getValue())
     input.onEscape = () => this.goTo(this.inputBackPage)
     this.activeInput = input
     this.pageContainer.addChild(input)
@@ -423,7 +443,7 @@ class VirtualProviderEditorDialog extends Container {
     this.pageContainer.addChild(new Spacer(1))
   }
 
-  private applyInput(purpose: 'provider-id' | 'model-id' | 'weight', raw: string): void {
+  private applyInput(purpose: 'provider-id' | 'model-id' | 'weight' | 'priority', raw: string): void {
     const value = raw.trim()
     if (purpose === 'provider-id') {
       if (!VIRTUAL_ID_PATTERN.test(value) || !this.isProviderIdAvailable(value)) {
@@ -448,6 +468,7 @@ class VirtualProviderEditorDialog extends Container {
         this.draft = {
           id: this.createProviderId!,
           label: this.createProviderId!,
+          strategy: 'round-robin',
           models: [{ id: value, backends: [] }],
         }
         this.pageError = 'Add at least one enabled backing provider model, then choose "Save and apply".'
@@ -466,6 +487,19 @@ class VirtualProviderEditorDialog extends Container {
       return
     }
     backend.weight = parsed
+    this.goTo({ kind: 'menu' })
+  }
+
+  private applyPriorityInput(raw: string): void {
+    const parsed = Number(raw.trim())
+    const backend = this.draft!.models[0]!.backends[this.activeBackendIndex]
+    if (!Number.isInteger(parsed) || parsed < 0 || backend === undefined) {
+      this.pageError = 'Priority must be an integer ≥ 0 (lower runs first).'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    backend.priority = parsed
     this.goTo({ kind: 'menu' })
   }
 }
@@ -834,6 +868,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         unregisterSchedulers.get(integration.id)?.()
         unregisterSchedulers.set(integration.id, service.registerProvider(integration))
         virtualIntegrations.set(integration.id, integration)
+        // The strategy is persisted with the config and (re)applied on every
+        // load or edit; round-robin keeps the virtual pool's unbiased rotation.
+        await service.updatePool(integration.id, { policy: config.strategy ?? 'round-robin' })
       }
 
       const virtualProvider = createVirtualProvider({

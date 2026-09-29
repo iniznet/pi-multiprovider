@@ -615,6 +615,39 @@ describe('virtual providers', () => {
     expect(headers['x-opencode-session']).toBe('pinned-elsewhere')
   })
 
+  it('carries backend priority into the scheduler and honors the priority strategy', async () => {
+    const config: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      strategy: 'priority',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'prov-a', modelId: 'model-a', priority: 5 },
+          { providerId: 'prov-b', modelId: 'model-b' },
+        ],
+      }],
+    }
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    const integrations = createVirtualIntegrations(config)
+    for (const integration of integrations) service.registerProvider(integration)
+    // Mirrors refreshVirtual: the persisted strategy is applied to the pool
+    // preference after registration.
+    for (const integration of integrations) {
+      await service.updatePool(integration.id, { policy: config.strategy ?? 'round-robin' })
+    }
+    const snapshot = await service.snapshot()
+    expect(snapshot.providers[0]?.policy).toBe('priority')
+    expect(snapshot.providers[0]?.accounts.map(account => account.priority)).toEqual([5, 0])
+    const schedulerId = virtualSchedulerId('pooled', 'ultra')
+    const first = await service.acquire({ providerId: schedulerId, affinityKey: 'session-1' })
+    const second = await service.acquire({ providerId: schedulerId, affinityKey: 'session-2' })
+    expect(first.accountId).toBe('prov-b::model-b')
+    expect(second.accountId).toBe('prov-b::model-b')
+    first.release({ status: 'success' })
+    second.release({ status: 'success' })
+  })
+
   it('reports placeholder auth once a backend is configured', async () => {
     const { virtual } = harness({ a: () => okStream('x'), b: () => okStream('x') })
     const resolution = await virtual.auth.apiKey!.resolve({

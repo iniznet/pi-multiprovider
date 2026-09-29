@@ -8,7 +8,12 @@ import {
   type OAuthCredential,
 } from '@earendil-works/pi-ai'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MultiAuthStore, type VirtualModelTemplate } from '../src/index.ts'
+import {
+  MultiAuthStore,
+  type SelectionPolicy,
+  type VirtualModelTemplate,
+  type VirtualProviderConfig,
+} from '../src/index.ts'
 
 const temporaryDirectories: string[] = []
 
@@ -329,6 +334,48 @@ describe('MultiAuthStore virtual providers', () => {
     expect(await store.removeVirtualProvider('pooled')).toBe(true)
     expect(await store.listVirtualProviders()).toEqual([])
     expect(await store.removeVirtualProvider('pooled')).toBe(false)
+  })
+
+  it('persists virtual pool strategy and backend priority, defaulting round-robin', async () => {
+    const { directory, store } = await storeFixture()
+    await store.saveVirtualProvider({
+      ...virtualConfig,
+      strategy: 'priority',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'prov-a', modelId: 'model-a', priority: 2 },
+          { providerId: 'prov-b', modelId: 'model-b' },
+        ],
+      }],
+    })
+    const stored = await store.getVirtualProvider('pooled')
+    expect(stored?.strategy).toBe('priority')
+    expect(stored?.models[0]?.backends[0]).toMatchObject({ priority: 2 })
+    expect(stored?.models[0]?.backends[1]).toMatchObject({ weight: 1 })
+    expect(stored?.models[0]?.backends[1]?.priority).toBeUndefined()
+    // Reload from disk: normalization preserves the strategy and priority.
+    const reloaded = await new MultiAuthStore(join(directory, 'multiprovider-auth.json'))
+      .getVirtualProvider('pooled')
+    expect(reloaded?.strategy).toBe('priority')
+    expect(reloaded?.models[0]?.backends[0]?.priority).toBe(2)
+  })
+
+  it('rejects unknown virtual pool strategies on save and load', async () => {
+    const { store } = await storeFixture()
+    const invalidStrategy: string = 'chaos'
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      strategy: invalidStrategy as SelectionPolicy,
+    })).rejects.toThrow('malformed strategy')
+    const { directory } = await storeFixture()
+    const path = join(directory, 'multiprovider-auth.json')
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      providers: {},
+      virtuals: { pooled: { ...virtualConfig, strategy: invalidStrategy } },
+    }))
+    await expect(new MultiAuthStore(path).listVirtualProviders()).rejects.toThrow('malformed strategy')
   })
 
   it('rejects malformed virtual provider configs on save and load', async () => {

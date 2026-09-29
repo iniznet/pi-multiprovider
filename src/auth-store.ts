@@ -11,7 +11,7 @@ import type {
   Provider,
 } from '@earendil-works/pi-ai'
 import { getAgentDir } from '@earendil-works/pi-coding-agent'
-import { SCHEDULER_SETTING_KEYS } from './types.ts'
+import { SELECTION_POLICIES, SCHEDULER_SETTING_KEYS } from './types.ts'
 import type {
   AuthKind,
   SchedulerSettings,
@@ -252,11 +252,13 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
         backend.template,
         `virtual model "${model.id}" backend "${backend.providerId}/${backend.modelId}"`,
       )
+      const priority = normalizeBackendPriority(backend.priority)
       return {
         providerId: backend.providerId,
         modelId: backend.modelId,
         ...(backend.enabled === undefined ? {} : { enabled: backend.enabled }),
         weight: normalizeWeight(backend.weight),
+        ...(priority === 0 ? {} : { priority }),
         ...(template === undefined ? {} : { template }),
       }
     })
@@ -266,7 +268,13 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
       backends,
     }
   })
-  return { id: candidate.id, label: candidate.label.trim(), models }
+  const strategy = normalizeStrategy(candidate.strategy, candidate.id)
+  return {
+    id: candidate.id,
+    label: candidate.label.trim(),
+    ...(strategy === undefined || strategy === 'round-robin' ? {} : { strategy }),
+    models,
+  }
 }
 
 function parseState(text: string): PersistedState {
@@ -327,6 +335,18 @@ function publicPool(providerId: string, pool: PersistedPool): MultiAuthPool {
 
 function normalizeWeight(value: number | undefined): number {
   return Number.isFinite(value) && (value ?? 0) > 0 ? Math.floor(value!) : 1
+}
+
+function normalizeBackendPriority(value: number | undefined): number {
+  return Number.isFinite(value) && (value ?? 0) >= 0 ? Math.floor(value!) : 0
+}
+
+function normalizeStrategy(value: unknown, providerId: string): SelectionPolicy | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !(SELECTION_POLICIES as readonly string[]).includes(value)) {
+    throw new Error(`multiprovider: malformed strategy for virtual provider "${providerId}"`)
+  }
+  return value as SelectionPolicy
 }
 
 function normalizePriority(value: number | undefined, fallback: number): number {

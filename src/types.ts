@@ -12,6 +12,12 @@ import type { ExtensionContext } from '@earendil-works/pi-coding-agent'
 
 export type AuthKind = 'api-key' | 'oauth' | 'service-account' | 'custom'
 export type SelectionPolicy = 'round-robin' | 'weighted-round-robin' | 'least-inflight' | 'priority'
+export const SELECTION_POLICIES: readonly SelectionPolicy[] = [
+  'round-robin',
+  'weighted-round-robin',
+  'least-inflight',
+  'priority',
+]
 export type FailureKind = 'rate-limit' | 'quota' | 'auth' | 'transient' | 'fatal'
 
 // How plain round-robin breaks ties when no session pin exists. 'first-account'
@@ -186,6 +192,8 @@ export interface VirtualBackend {
   modelId: string
   enabled?: boolean
   weight?: number
+  /** Failover order under the priority strategy: smaller numbers run first. */
+  priority?: number
   template?: VirtualModelTemplate
 }
 
@@ -196,11 +204,13 @@ export interface VirtualModelConfig {
 }
 
 // A virtual provider maps one virtual model (or several) to backing provider
-// models so sessions round-robin across providers while keeping per-session
-// cache affinity.
+// models while keeping per-session cache affinity. The pool strategy defaults
+// to round-robin with unbiased rotation (selectionBias 'none'), and can be
+// changed to any pool strategy; it is persisted with the config.
 export interface VirtualProviderConfig {
   id: string
   label: string
+  strategy?: SelectionPolicy
   models: VirtualModelConfig[]
 }
 

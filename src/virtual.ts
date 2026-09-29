@@ -112,6 +112,7 @@ export function createVirtualIntegrations(
           authKind: 'custom' as const,
           credentialRef: backend,
           weight: backend.weight ?? 1,
+          priority: backend.priority ?? 0,
           metadata: { virtual: true, providerId: backend.providerId, modelId: backend.modelId },
         })),
     classifyFailure: (failure: ProviderAttemptFailure) => {
