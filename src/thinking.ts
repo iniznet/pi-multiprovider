@@ -63,21 +63,12 @@ export function resolveVirtualThinkingMap(
   const intersection = ALL_LEVELS.filter(level =>
     reasoningSources.every(source => supportedThinkingLevels(source).has(level)))
 
-  // pi clamps the default level by walking up the canonical order from
-  // "medium" (high -> xhigh -> max, then down to low). The operator's order
-  // prefers low over max; when only those two are available the advertised
-  // map must hide max so the clamp lands on low instead of walking up past
-  // it. The backing models still accept max at dispatch time.
+  // pi clamps an unsupported requested level by walking UP the canonical
+  // order (high -> xhigh -> max) before walking down, so the operator's
+  // "deepest reasoning possible" preference is served by advertising the
+  // full intersection untouched: a pool that only supports {low, max}
+  // defaults to max, and every surviving level stays selectable per session.
   const preferred = new Set(intersection)
-  if (
-    preferred.has('max')
-    && preferred.has('low')
-    && !preferred.has('high')
-    && !preferred.has('medium')
-    && !preferred.has('xhigh')
-  ) {
-    preferred.delete('max')
-  }
 
   const map: ThinkingLevelMap = {}
   for (const level of ALL_LEVELS) {

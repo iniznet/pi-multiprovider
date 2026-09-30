@@ -38,14 +38,15 @@ describe('resolveVirtualThinkingMap', () => {
     expect(map).toEqual({ off: null, minimal: null, low: 'low', medium: null, high: 'high' })
   })
 
-  it('hides max when only max and low survive the intersection', () => {
+  it('keeps max when only max and low survive the intersection (deepest wins)', () => {
     const map = resolveVirtualThinkingMap([
       { reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: null, max: 'max' } },
       { reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: null, max: 'max' } },
     ])
     // pi clamps its default up the canonical order (medium -> high -> xhigh ->
-    // max -> low); the operator prefers low over max, so max is not advertised.
-    expect(map).toEqual({ off: null, minimal: null, low: 'low', medium: null, high: null })
+    // The operator prefers the deepest reasoning possible, so max stays
+    // advertised and pi's clamp walks up to it when high is unavailable.
+    expect(map).toEqual({ off: null, minimal: null, low: 'low', medium: null, high: null, max: 'max' })
   })
 
   it('keeps max when it is the only surviving level', () => {
