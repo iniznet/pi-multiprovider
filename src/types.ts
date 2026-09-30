@@ -179,6 +179,12 @@ export interface VirtualModelTemplate {
   baseUrl: string
   reasoning: boolean
   thinkingLevelMap?: Model<Api>['thinkingLevelMap']
+  // Provider request-shaping flags (supportsReasoningEffort, thinkingFormat,
+  // maxTokensField, ...). Without them the virtual model would let pi-ai
+  // auto-detect compat from the virtual provider id instead of the backing
+  // provider's, so a payload through the alias could differ from a direct call
+  // to the same model.
+  compat?: Model<Api>['compat']
   input: Model<Api>['input']
   cost: Model<Api>['cost']
   contextWindow: number

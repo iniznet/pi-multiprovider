@@ -515,6 +515,9 @@ export function captureVirtualModelTemplate(model: Model<Api>): VirtualModelTemp
     baseUrl: model.baseUrl,
     reasoning: model.reasoning,
     ...(model.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: model.thinkingLevelMap }),
+    ...(model.compat === undefined
+      ? {}
+      : { compat: structuredClone(model.compat) as Model<Api>['compat'] }),
     input: [...model.input],
     cost: { ...model.cost },
     contextWindow: model.contextWindow,
@@ -522,26 +525,33 @@ export function captureVirtualModelTemplate(model: Model<Api>): VirtualModelTemp
   }
 }
 
-// Fill in missing persisted templates from live backing models. Returns a
-// cloned config when anything was added, else undefined — callers persist the
-// healed config so the next extension load snapshots virtual models with
-// correct thinking metadata without waiting for an editor save.
+// Bring persisted templates up to date from live backing models: fills in
+// templates captured before this feature existed, and refreshes fields an
+// older template predates (currently `compat`). Returns a cloned config when
+// anything changed, else undefined — callers persist the healed config so the
+// next extension load snapshots virtual models with correct thinking and
+// request-shaping metadata without waiting for an editor save.
 export function healVirtualTemplates(
   config: VirtualProviderConfig,
   resolveTemplate: (providerId: string, modelId: string) => VirtualModelTemplate | undefined,
 ): VirtualProviderConfig | undefined {
-  let added = false
+  let healed = false
   const models = config.models.map(model => ({
     ...model,
     backends: model.backends.map(backend => {
-      if (backend.enabled === false || backend.template !== undefined) return backend
-      const template = resolveTemplate(backend.providerId, backend.modelId)
-      if (template === undefined) return backend
-      added = true
-      return { ...backend, template }
+      if (backend.enabled === false) return backend
+      const live = resolveTemplate(backend.providerId, backend.modelId)
+      if (live === undefined) return backend
+      if (backend.template === undefined) {
+        healed = true
+        return { ...backend, template: live }
+      }
+      if (backend.template.compat !== undefined || live.compat === undefined) return backend
+      healed = true
+      return { ...backend, template: { ...backend.template, compat: live.compat } }
     }),
   }))
-  return added ? { ...config, models } : undefined
+  return healed ? { ...config, models } : undefined
 }
 
 export function createVirtualProvider(dependencies: VirtualProviderDependencies): Provider<Api> {
@@ -577,6 +587,11 @@ export function createVirtualProvider(dependencies: VirtualProviderDependencies)
       baseUrl: source?.baseUrl ?? '',
       reasoning: sources.some(item => item.reasoning),
       ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
+      // Request-shaping flags follow the same source as api/baseUrl: a
+      // consumer that dispatches the virtual model directly must build the
+      // same payload the backing provider would, or e.g. a provider that
+      // rejects native reasoning control gets sent reasoning_effort anyway.
+      ...(source?.compat === undefined ? {} : { compat: source.compat }),
       input: source?.input ?? ['text'],
       cost: source?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: source?.contextWindow ?? 128_000,

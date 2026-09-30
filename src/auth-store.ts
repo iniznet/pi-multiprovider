@@ -211,6 +211,15 @@ function normalizeVirtualTemplate(value: unknown, backendLabel: string): Virtual
       thinkingLevelMap[level] = effort
     }
   }
+  let compat: VirtualModelTemplate['compat'] | undefined
+  if (candidate.compat !== undefined) {
+    if (typeof candidate.compat !== 'object' || candidate.compat === null || Array.isArray(candidate.compat)) {
+      throw malformed()
+    }
+    // Provider-owned opaque flags: validated as a record, passed through as-is
+    // so pi-ai sees exactly what the backing model advertised.
+    compat = candidate.compat
+  }
   const rates = {
     input: cost.input as number,
     output: cost.output as number,
@@ -227,6 +236,7 @@ function normalizeVirtualTemplate(value: unknown, backendLabel: string): Virtual
     ...(thinkingLevelMap === undefined
       ? {}
       : { thinkingLevelMap: thinkingLevelMap as VirtualModelTemplate['thinkingLevelMap'] }),
+    ...(compat === undefined ? {} : { compat }),
     input: input as VirtualModelTemplate['input'],
     cost: tiers === undefined ? rates : { ...rates, tiers },
     contextWindow: candidate.contextWindow,

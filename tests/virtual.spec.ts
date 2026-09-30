@@ -354,6 +354,74 @@ describe('virtual providers', () => {
     expect(model.thinkingLevelMap).toBeUndefined()
   })
 
+  it('heals stored templates that predate compat flags', () => {
+    const stale = { ...captureVirtualModelTemplate(modelA) }
+    const fresh = { ...captureVirtualModelTemplate(modelA), compat: { supportsReasoningEffort: false } }
+    const withTemplate: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a', template: stale }] }],
+    }
+    const healed = healVirtualTemplates(withTemplate, () => fresh)
+    expect(healed?.models[0]?.backends[0]?.template?.compat).toEqual({ supportsReasoningEffort: false })
+    // An operator edit is never overwritten: a template that already carries
+    // compat is left exactly as stored.
+    const after = healVirtualTemplates(
+      { ...withTemplate, models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a', template: healed!.models[0]!.backends[0]!.template! }] }] },
+      () => ({ ...fresh, compat: { supportsReasoningEffort: true } }),
+    )
+    expect(after).toBeUndefined()
+    expect(healVirtualTemplates(withTemplate, () => stale)).toBeUndefined()
+  })
+
+  it('carries the backing model compat flags onto the virtual model', () => {
+    // Providers shape the request through model.compat (e.g. opencode-go marks
+    // a model that rejects native reasoning control). pi-ai falls back to
+    // auto-detecting compat from the provider id + baseUrl, so a virtual model
+    // without these flags could build a payload the backing provider rejects.
+    const compatModel: Model<'openai-completions'> = {
+      ...modelA,
+      api: 'openai-completions',
+      id: 'glm-5.3-flash',
+      provider: 'opencode-go',
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      compat: { supportsReasoningEffort: false },
+    }
+    const template = captureVirtualModelTemplate(compatModel)
+    expect(template.compat).toEqual({ supportsReasoningEffort: false })
+    // Captured by value: a later template edit must not mutate the live model.
+    ;(template.compat as { supportsReasoningEffort?: boolean }).supportsReasoningEffort = true
+    expect(compatModel.compat?.supportsReasoningEffort).toBe(false)
+
+    const virtual = createVirtualProvider({
+      service: new MultiProviderService(),
+      config: {
+        id: 'pooled',
+        label: 'Pooled',
+        models: [{ id: 'ultra', backends: [{ providerId: 'opencode-go', modelId: 'glm-5.3-flash', template }] }],
+      },
+      getBackingProvider: () => undefined,
+      getAffinityKey: () => 'session-1',
+      resolveAmbientAuth: async () => ({ ok: true }),
+    })
+    expect(virtual.getModels()[0]!.compat).toEqual({ supportsReasoningEffort: true })
+
+    const plain = createVirtualProvider({
+      service: new MultiProviderService(),
+      config: {
+        id: 'pooled',
+        label: 'Pooled',
+        models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a' }] }],
+      },
+      getBackingProvider: providerId =>
+        providerId === 'prov-a' ? backend('prov-a', modelA, () => okStream('x')) : undefined,
+      getAffinityKey: () => 'session-1',
+      resolveAmbientAuth: async () => ({ ok: true }),
+    })
+    // A model with no compat keeps the key absent so pi-ai auto-detects as usual.
+    expect(plain.getModels()[0]!.compat).toBeUndefined()
+  })
+
   it('heals stored configs by filling missing templates from live backings', () => {
     const resolved = healVirtualTemplates(config, (providerId, modelId) =>
       providerId === 'prov-a' && modelId === 'model-a' ? captureVirtualModelTemplate(modelA) : undefined)

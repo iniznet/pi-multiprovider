@@ -365,6 +365,36 @@ describe('MultiAuthStore virtual providers', () => {
     expect(reloaded?.models[0]?.backends[0]?.priority).toBe(2)
   })
 
+  it('persists backend template compat flags and rejects malformed ones', async () => {
+    const { directory, store } = await storeFixture()
+    const compat = { supportsReasoningEffort: false, maxTokensField: 'max_tokens' } as const
+    const template = {
+      api: 'openai-completions' as const,
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      reasoning: true,
+      compat,
+      input: ['text'] as ('text' | 'image')[],
+      cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 3 },
+      contextWindow: 100_000,
+      maxTokens: 4096,
+    }
+    await store.saveVirtualProvider({
+      ...virtualConfig,
+      models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a', template }] }],
+    })
+    const stored = await store.getVirtualProvider('pooled')
+    expect(stored?.models[0]?.backends[0]?.template?.compat).toEqual(compat)
+    const reloaded = await new MultiAuthStore(join(directory, 'multiprovider-auth.json'))
+      .getVirtualProvider('pooled')
+    expect(reloaded?.models[0]?.backends[0]?.template?.compat).toEqual(compat)
+
+    const broken = { ...template, compat: 'nope' } as unknown as VirtualModelTemplate
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      models: [{ id: 'ultra', backends: [{ providerId: 'prov-a', modelId: 'model-a', template: broken }] }],
+    })).rejects.toThrow('malformed template')
+  })
+
   it('rejects unknown virtual pool strategies on save and load', async () => {
     const { store } = await storeFixture()
     const invalidStrategy: string = 'chaos'
