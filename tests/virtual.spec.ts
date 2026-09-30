@@ -170,10 +170,12 @@ function harness(
     missingProviders?: string[]
     isBackendConfigured?: (providerId: string) => boolean
     affinityKey?: string
+    affinityKeyFn?: () => string
   } = {},
   options: {
     errorsBeforeSwitch?: number
     onFailover?: VirtualProviderDependencies['onFailover']
+    deps?: Partial<VirtualProviderDependencies>
   } = {},
 ) {
   const attempts: Attempt[] = []
@@ -207,10 +209,12 @@ function harness(
     service.registerProvider(integration)
   }
   const deps: VirtualProviderDependencies = {
+    ...(options.deps ?? {}),
     service,
     config,
     ...(options.onFailover === undefined ? {} : { onFailover: options.onFailover }),
-    getAffinityKey: () => overrides.affinityKey ?? 'session-1',
+    getAffinityKey: () =>
+      overrides.affinityKeyFn?.() ?? overrides.affinityKey ?? 'session-1',
     getBackingProvider: providerId =>
       overrides.missingProviders?.includes(providerId) ? undefined : providers.get(providerId),
     resolveAmbientAuth: async providerId => ({ ok: true, apiKey: 'ambient-' + providerId }),
@@ -250,9 +254,10 @@ describe('virtual providers', () => {
       provider: 'pooled',
       api: 'test-api',
       baseUrl: 'https://a.invalid',
-      thinkingLevelMap: { high: 'high-effort', off: null },
       contextWindow: 1_000,
     })
+    // No reasoning backend -> the map is simply not advertised.
+    expect(models[0]!.thinkingLevelMap).toBeUndefined()
   })
 
   it('falls back to the persisted backend template before backing providers register', () => {
@@ -282,7 +287,9 @@ describe('virtual providers', () => {
       api: 'test-api',
       baseUrl: 'https://a.invalid',
       reasoning: true,
-      thinkingLevelMap: { high: 'high-effort', off: null },
+      // Single reasoning source: the identity map over the levels it supports
+      // (off explicitly null on the source; minimal/low/medium/high pass).
+      thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high' },
       contextWindow: 1_000,
       maxTokens: 100,
     })
@@ -318,9 +325,9 @@ describe('virtual providers', () => {
       api: 'test-api',
       baseUrl: 'https://a.invalid',
       reasoning: false,
-      thinkingLevelMap: { high: 'high-effort', off: null },
       contextWindow: 1_000,
     })
+    expect(virtual.getModels()[0]!.thinkingLevelMap).toBeUndefined()
   })
 
   it('ignores persisted templates on disabled backends', () => {
@@ -655,5 +662,191 @@ describe('virtual providers', () => {
       signal: new AbortController().signal,
     })
     expect(resolution).toMatchObject({ auth: { apiKey: 'virtual-provider' }, source: 'virtual provider' })
+  })
+
+  it('advertises the thinking-level intersection across enabled backends', () => {
+    const reasoningA: Model<'test-api'> = {
+      ...modelA,
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: 'high', max: 'max' },
+    }
+    const reasoningB: Model<'test-api'> = {
+      ...modelB,
+      reasoning: true,
+      thinkingLevelMap: { off: null, low: 'low', medium: 'medium', high: 'high' },
+    }
+    const virtual = createVirtualProvider({
+      service: new MultiProviderService({ randomInt: () => 0 }),
+      config: {
+        id: 'pooled',
+        label: 'Pooled',
+        models: [{
+          id: 'ultra',
+          backends: [
+            { providerId: 'prov-a', modelId: 'model-a' },
+            { providerId: 'prov-b', modelId: 'model-b' },
+          ],
+        }],
+      },
+      getBackingProvider: providerId =>
+        providerId === 'prov-a'
+          ? backend('prov-a', reasoningA, () => okStream('x'))
+          : backend('prov-b', reasoningB, () => okStream('x')),
+      getAffinityKey: () => 'session-1',
+      resolveAmbientAuth: async () => ({ ok: true }),
+    })
+    // Intersection of {low, high, max} and {low, medium, high}: low + high.
+    expect(virtual.getModels()[0]!.thinkingLevelMap).toEqual({
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: null,
+      high: 'high',
+    })
+  })
+
+  it('skips backends that cannot serve the requested thinking level', async () => {
+    // prov-a's model only maps low/medium; a request at high must not reach it.
+    const limitedA: Model<'test-api'> = {
+      ...modelA,
+      reasoning: true,
+      thinkingLevelMap: { off: null, low: 'low', medium: 'medium', high: null },
+    }
+    const reasoningB: Model<'test-api'> = {
+      ...modelB,
+      reasoning: true,
+      thinkingLevelMap: { off: null, low: 'low', medium: 'medium', high: 'high' },
+    }
+    const httpAttempts: string[] = []
+    const flagged: string[] = []
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    for (const integration of createVirtualIntegrations(config)) service.registerProvider(integration)
+    const virtual = createVirtualProvider({
+      service,
+      config,
+      getAffinityKey: () => 'session-1',
+      getBackingProvider: providerId =>
+        providerId === 'prov-a'
+          ? backend('prov-a', limitedA, model => { httpAttempts.push(model.provider + '/' + model.id); return okStream('from-a') })
+          : backend('prov-b', reasoningB, model => { httpAttempts.push(model.provider + '/' + model.id); return okStream('from-b') }),
+      resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
+      onBackendFatalMetadata: (providerId, modelId) => flagged.push(providerId + '/' + modelId),
+    })
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context, { reasoningEffort: 'high' }))
+    // prov-a/model-a cannot serve high: skipped without an HTTP attempt and
+    // flagged; prov-b/model-b (reasoning true, high supported) serves.
+    expect(httpAttempts).toEqual(['prov-b/model-b'])
+    expect(flagged).toEqual(['prov-a/model-a'])
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+  })
+
+  it('allows non-reasoning backends to serve requests at any thinking level', async () => {
+    const { virtual, attempts } = harness({ a: () => okStream('from-a'), b: () => okStream('x') })
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context, { reasoningEffort: 'high' }))
+    expect(attempts.map(attempt => attempt.provider)).toEqual(['prov-a'])
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+  })
+
+  it('flags the provider on a quota failure and fails over, then skips it without HTTP', async () => {
+    const blockedProviders = new Set<string>()
+    let request = 0
+    const { virtual, attempts } = harness(
+      {
+        // Session affinity pins request 1 to prov-a; its 402 on request 2
+        // flags the whole provider so the failover lands on prov-b.
+        a: () => {
+          request += 1
+          return request === 1
+            ? okStream('from-a')
+            : errorStream('402: {"message":"You are out of credits. Add more at https://hyper.charm.land"}')
+        },
+        b: () => okStream('from-b'),
+      },
+      {},
+      {
+        errorsBeforeSwitch: 1,
+        deps: {
+          isProviderBlocked: providerId => blockedProviders.has(providerId),
+          onBackendQuotaFailure: providerId => { blockedProviders.add(providerId) },
+        },
+      },
+    )
+    // Request 1: prov-a serves and pins the session.
+    let events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    // Request 2: prov-a 402s pre-output -> provider flagged -> failover to prov-b.
+    events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(blockedProviders.has('prov-a')).toBe(true)
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    // Request 3: prov-a is quota-blocked -> skipped without an HTTP attempt.
+    events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(blockedProviders.has('prov-a')).toBe(true)
+    expect(attempts.filter(attempt => attempt.provider === 'prov-a')).toHaveLength(2)
+    expect(attempts.filter(attempt => attempt.provider === 'prov-b')).toHaveLength(2)
+    expect(attempts.at(-1)?.provider).toBe('prov-b')
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+  })
+
+  it('surfaces a clear error when every backend is quota-blocked', async () => {
+    const blockedProviders = new Set(['prov-a', 'prov-b'])
+    const { virtual, attempts } = harness(
+      { a: () => okStream('x'), b: () => okStream('x') },
+      {},
+      {
+        deps: {
+          isProviderBlocked: providerId => blockedProviders.has(providerId),
+        },
+      },
+    )
+    // Terminal-error convention: the stream replays a clear quota-blocked
+    // error event instead of throwing mid-iteration.
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(attempts).toEqual([])
+    const last = events.at(-1)!
+    expect(last).toMatchObject({ type: 'error' })
+    if (last.type === 'error') expect(last.error.errorMessage).toMatch(/quota-blocked/)
+  })
+
+  it('flags fatal metadata errors and skips the flagged pair afterwards', async () => {
+    const flaggedPairs: string[] = []
+    const flaggedSet = new Set<string>()
+    let request = 0
+    const { virtual, attempts } = harness(
+      {
+        // Session affinity pins request 1 to prov-a; its 400 invalid_request
+        // on request 2 is fatal for the (provider, model) pair.
+        a: () => {
+          request += 1
+          return request === 1
+            ? okStream('from-a')
+            : errorStream('400: {"type":"invalid_request_error","message":"native reasoning control reasoning_effort is not allowed"}')
+        },
+        b: () => okStream('from-b'),
+      },
+      {},
+      {
+        errorsBeforeSwitch: 1,
+        deps: {
+          isModelFlagged: (providerId, modelId) => flaggedSet.has(providerId + '/' + modelId),
+          onBackendFatalMetadata: (providerId, modelId) => {
+            flaggedSet.add(providerId + '/' + modelId)
+            flaggedPairs.push(providerId + '/' + modelId)
+          },
+        },
+      },
+    )
+    // Request 1: prov-a serves and pins the session.
+    let events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    // Request 2: prov-a's 400 invalid_request is fatal for the pair -> surfaced.
+    events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'error' })
+    expect(flaggedSet.has('prov-a/model-a')).toBe(true)
+    // Request 3: the flagged pair is skipped without an HTTP attempt.
+    events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    expect(attempts.filter(attempt => attempt.provider === 'prov-a')).toHaveLength(2)
+    expect(attempts.at(-1)?.provider).toBe('prov-b')
+    expect(flaggedPairs).toEqual(['prov-a/model-a'])
   })
 })

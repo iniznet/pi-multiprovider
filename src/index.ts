@@ -4,6 +4,8 @@ export * from './errors.ts'
 export * from './service.ts'
 export { liftProvider } from './lift.ts'
 export {
+  BACKEND_INCOMPATIBLE_PREFIX,
+  BACKEND_QUOTA_BLOCKED_PREFIX,
   BACKEND_UNAVAILABLE_PREFIX,
   VIRTUAL_ID_SEPARATOR,
   captureVirtualModelTemplate,
@@ -16,6 +18,22 @@ export {
   type VirtualIntegrationOptions,
   type VirtualProviderDependencies,
 } from './virtual.ts'
+export {
+  computeResetAt,
+  describeBillingPolicy,
+  isFatalMetadataFailure,
+  isQuotaFailure,
+  normalizeBillingPolicy,
+  normalizeProviderQuotaEntry,
+} from './quota.ts'
+export {
+  resolveVirtualThinkingMap,
+  supportedThinkingLevels,
+  VIRTUAL_DEFAULT_LEVEL_ORDER,
+  type ModelThinkingLevel,
+  type ThinkingLevelMap,
+  type ThinkingSource,
+} from './thinking.ts'
 export {
   createServiceAnnouncement,
   type AnnouncementDependencies,

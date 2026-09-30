@@ -12,8 +12,11 @@ import type {
 } from '@earendil-works/pi-ai'
 import { getAgentDir } from '@earendil-works/pi-coding-agent'
 import { SELECTION_POLICIES, SCHEDULER_SETTING_KEYS } from './types.ts'
+import { normalizeProviderQuotaEntry, normalizeBillingPolicy } from './quota.ts'
 import type {
   AuthKind,
+  BillingPolicy,
+  ProviderQuotaState,
   SchedulerSettings,
   SchedulerSettingsPatch,
   SelectionPolicy,
@@ -86,11 +89,18 @@ interface PersistedPool {
   accounts: PersistedAccount[]
 }
 
+interface PersistedProviderQuota {
+  billing?: BillingPolicy
+  blockedUntil?: number
+  reason?: string
+}
+
 interface PersistedState {
   version: 1
   scheduler?: SchedulerSettings
   providers: Record<string, PersistedPool>
   virtuals?: Record<string, VirtualProviderConfig>
+  providerQuota?: Record<string, PersistedProviderQuota>
 }
 
 const DEFAULT_POLICY: SelectionPolicy = 'round-robin'
@@ -101,6 +111,19 @@ const unsafeKeys = new Set(['__proto__', 'prototype', 'constructor'])
 
 function emptyState(): PersistedState {
   return { version: 1, providers: {} }
+}
+
+function normalizeProviderQuota(value: unknown): Record<string, PersistedProviderQuota> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('multiprovider: malformed provider quota section')
+  }
+  const normalized: Record<string, PersistedProviderQuota> = {}
+  for (const [providerId, entry] of Object.entries(value)) {
+    assertSafeKey(providerId, 'provider id')
+    const parsed = normalizeProviderQuotaEntry(entry)
+    if (Object.keys(parsed).length > 0) normalized[providerId] = parsed
+  }
+  return normalized
 }
 
 function assertSafeKey(value: string, label: string): void {
@@ -312,6 +335,11 @@ function parseState(text: string): PersistedState {
   if (candidate.virtuals !== undefined) {
     for (const virtualValue of Object.values(candidate.virtuals)) {
       normalizeVirtualProvider(virtualValue)
+    }
+  }
+  if (candidate.providerQuota !== undefined) {
+    for (const entry of Object.values(candidate.providerQuota)) {
+      normalizeProviderQuotaEntry(entry)
     }
   }
   return candidate as PersistedState
@@ -606,6 +634,65 @@ export class MultiAuthStore {
       if (state.virtuals?.[id] === undefined) return false
       delete state.virtuals[id]
       if (Object.keys(state.virtuals).length === 0) delete state.virtuals
+      return true
+    })
+  }
+
+  async listProviderQuota(): Promise<Record<string, ProviderQuotaState>> {
+    const state = await this.readState()
+    return structuredClone(state.providerQuota ?? {})
+  }
+
+  async getProviderQuota(providerId: string): Promise<ProviderQuotaState | undefined> {
+    assertSafeKey(providerId, 'provider id')
+    const state = await this.readState()
+    const entry = state.providerQuota?.[providerId]
+    return entry === undefined ? undefined : structuredClone(entry)
+  }
+
+  async setProviderBilling(providerId: string, billing: BillingPolicy | undefined): Promise<void> {
+    assertSafeKey(providerId, 'provider id')
+    const normalized = normalizeBillingPolicy(billing)
+    await this.mutate(state => {
+      if (normalized === undefined) {
+        if (state.providerQuota?.[providerId] === undefined) return
+        delete state.providerQuota![providerId]!.billing
+        if (Object.keys(state.providerQuota![providerId]!).length === 0) delete state.providerQuota![providerId]
+        if (Object.keys(state.providerQuota!).length === 0) delete state.providerQuota
+        return
+      }
+      state.providerQuota ??= {}
+      const entry: PersistedProviderQuota = state.providerQuota[providerId]
+        ?? (state.providerQuota[providerId] = {})
+      entry.billing = normalized
+    })
+  }
+
+  async blockProvider(providerId: string, blockedUntil: number, reason: string): Promise<void> {
+    assertSafeKey(providerId, 'provider id')
+    if (!Number.isFinite(blockedUntil)) {
+      throw new Error('multiprovider: provider quota block deadline must be a number')
+    }
+    await this.mutate(state => {
+      state.providerQuota ??= {}
+      const entry: PersistedProviderQuota = state.providerQuota[providerId]
+        ?? (state.providerQuota[providerId] = {})
+      entry.blockedUntil = blockedUntil
+      const trimmed = reason.trim()
+      if (trimmed === '') delete entry.reason
+      else entry.reason = trimmed.slice(0, 300)
+    })
+  }
+
+  async clearProviderBlock(providerId: string): Promise<boolean> {
+    assertSafeKey(providerId, 'provider id')
+    return this.mutate(state => {
+      const entry = state.providerQuota?.[providerId]
+      if (entry === undefined || entry.blockedUntil === undefined) return false
+      delete entry.blockedUntil
+      delete entry.reason
+      if (Object.keys(entry).length === 0) delete state.providerQuota![providerId]
+      if (Object.keys(state.providerQuota!).length === 0) delete state.providerQuota
       return true
     })
   }

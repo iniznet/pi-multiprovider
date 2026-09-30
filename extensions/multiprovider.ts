@@ -19,7 +19,12 @@ import {
 } from '@earendil-works/pi-tui'
 import {
   applySessionPins,
+  BACKEND_INCOMPATIBLE_PREFIX,
+  BACKEND_QUOTA_BLOCKED_PREFIX,
+  BILLING_RESET_KINDS,
+  computeResetAt,
   createManagedIntegration,
+  describeBillingPolicy,
   createServiceAnnouncement,
   getMultiAuthPath,
   type FailoverInfo,
@@ -29,6 +34,10 @@ import {
   MultiAuthStore,
   MultiProviderService,
   PI_UPSTREAM_ACCOUNT_ID,
+  SCHEDULER_DEFAULTS,
+  VIRTUAL_ID_SEPARATOR,
+  type BillingPolicy,
+  type ProviderAttemptFailure,
   type MultiAuthUpstreamPreferences,
   type MultiProviderIntegration,
   type MultiProviderServiceContext,
@@ -109,7 +118,7 @@ class DynamicColumnSettingsList extends SettingsList {
 
 type VirtualEditorOutcome =
   | { kind: 'dismissed' }
-  | { kind: 'saved'; draft: VirtualProviderConfig }
+  | { kind: 'saved'; draft: VirtualProviderConfig; billing?: Record<string, BillingPolicy | undefined> }
   | { kind: 'discarded' }
   | { kind: 'removed'; id: string }
 
@@ -132,6 +141,13 @@ class VirtualProviderEditorDialog extends Container {
   private readonly candidates: Provider<Api>[]
   private readonly isProviderIdAvailable: (id: string) => boolean
   private readonly done: (outcome: VirtualEditorOutcome) => void
+  // Staged billing-marking edits (undefined value = marking off), persisted
+  // with the save outcome so Save-and-apply stays the single commit point.
+  private readonly billingDraft = new Map<string, BillingPolicy | undefined>()
+  private readonly providerBilling: (providerId: string) => BillingPolicy | undefined
+  private readonly providerBlockUntil: (providerId: string) => number | undefined
+  private readonly isBackendFlagged: (providerId: string, modelId: string) => boolean
+  private readonly clearProviderBlock: (providerId: string) => void
   private readonly pageContainer = new Container()
   private readonly listTheme: SettingsListTheme
   private draft: VirtualProviderConfig | undefined
@@ -151,6 +167,10 @@ class VirtualProviderEditorDialog extends Container {
     candidates: Provider<Api>[]
     isProviderIdAvailable: (id: string) => boolean
     startDraft: VirtualProviderConfig | undefined
+    providerBilling?: (providerId: string) => BillingPolicy | undefined
+    providerBlockUntil?: (providerId: string) => number | undefined
+    isBackendFlagged?: (providerId: string, modelId: string) => boolean
+    clearProviderBlock?: (providerId: string) => void
     done: (outcome: VirtualEditorOutcome) => void
   }) {
     super()
@@ -158,6 +178,10 @@ class VirtualProviderEditorDialog extends Container {
     this.stored = options.stored
     this.candidates = options.candidates
     this.isProviderIdAvailable = options.isProviderIdAvailable
+    this.providerBilling = options.providerBilling ?? (() => undefined)
+    this.providerBlockUntil = options.providerBlockUntil ?? (() => undefined)
+    this.isBackendFlagged = options.isBackendFlagged ?? (() => false)
+    this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
     this.done = options.done
     this.draft = options.startDraft
     this.page = options.startDraft === undefined ? { kind: 'root' } : { kind: 'menu' }
@@ -266,20 +290,57 @@ class VirtualProviderEditorDialog extends Container {
     )
   }
 
+  // Billing-cycle sequence behind the per-provider row: off -> daily ->
+  // weekly -> monthly -> 5h window -> off.
+  private static readonly BILLING_CYCLE: (BillingPolicy | undefined)[] = [
+    undefined,
+    { kind: 'daily' },
+    { kind: 'weekly' },
+    { kind: 'monthly' },
+    { kind: 'hours', hours: 5 },
+  ]
+
+  private billingLabel(providerId: string): string {
+    const staged = this.billingDraft.has(providerId)
+      ? this.billingDraft.get(providerId)
+      : this.providerBilling(providerId)
+    return staged === undefined ? 'off' : describeBillingPolicy(staged)
+  }
+
   private buildMenu(): void {
     const model = this.draft!.models[0]!
     const strategy = this.draft!.strategy ?? 'round-robin'
+    const billingProviders = [...new Set(
+      model.backends.filter(backend => backend.enabled !== false).map(backend => backend.providerId),
+    )]
+    const blockedProviders = billingProviders.filter(
+      providerId => (this.providerBlockUntil(providerId) ?? 0) > Date.now(),
+    )
     const items: SettingItem[] = [
       this.menuItem('model-id', `Model id: ${model.id}`),
       this.menuItem('strategy', `Strategy: ${strategy}`),
       this.menuItem('add', 'Add backing provider model'),
-      this.separatorItem('sep-top'),
-      ...model.backends.map((backend, index) => this.menuItem(
-        `backend-${index}`,
-        `${index + 1}. ${backend.providerId}`
-          + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`
-            + (backend.priority === undefined ? '' : ` · p${backend.priority}`)),
+      ...billingProviders.map(providerId => this.menuItem(
+        'billing-' + providerId,
+        `Billing (${providerId}): ${this.billingLabel(providerId)}`,
       )),
+      ...blockedProviders.map(providerId => this.menuItem(
+        'clear-quota-' + providerId,
+        `Clear quota block (${providerId} · until ${new Date(this.providerBlockUntil(providerId)!).toLocaleTimeString()})`,
+      )),
+      this.separatorItem('sep-top'),
+      ...model.backends.map((backend, index) => {
+        const blocked = (this.providerBlockUntil(backend.providerId) ?? 0) > Date.now()
+        const flagged = this.isBackendFlagged(backend.providerId, backend.modelId)
+        return this.menuItem(
+          `backend-${index}`,
+          `${index + 1}. ${backend.providerId}`
+            + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`
+              + (backend.priority === undefined ? '' : ` · p${backend.priority}`)
+              + (blocked ? ' · quota-blocked' : '')
+              + (flagged ? ' · flagged' : '')),
+        )
+      }),
       this.separatorItem('sep-bottom'),
       this.menuItem('save', 'Save and apply'),
       this.menuItem('discard', 'Discard changes'),
@@ -300,6 +361,20 @@ class VirtualProviderEditorDialog extends Container {
           const next = SELECTION_POLICIES[(SELECTION_POLICIES.indexOf(current) + 1) % SELECTION_POLICIES.length]!
           this.draft!.strategy = next
           this.goTo({ kind: 'menu' })
+        } else if (id.startsWith('billing-')) {
+          const providerId = id.slice('billing-'.length)
+          const cycle = VirtualProviderEditorDialog.BILLING_CYCLE
+          const current = this.billingDraft.has(providerId)
+            ? this.billingDraft.get(providerId)
+            : this.providerBilling(providerId)
+          const index = cycle.findIndex(
+            entry => entry === undefined ? current === undefined : entry.kind === current?.kind,
+          )
+          this.billingDraft.set(providerId, cycle[(index + 1) % cycle.length]!)
+          this.goTo({ kind: 'menu' })
+        } else if (id.startsWith('clear-quota-')) {
+          this.clearProviderBlock(id.slice('clear-quota-'.length))
+          this.goTo({ kind: 'menu' })
         } else if (id === 'add') {
           this.goTo({ kind: 'provider-picker' })
         } else if (id === 'save') {
@@ -319,7 +394,14 @@ class VirtualProviderEditorDialog extends Container {
               .find(item => item.id === backend.modelId)
             if (candidate !== undefined) backend.template = captureVirtualModelTemplate(candidate)
           }
-          this.done({ kind: 'saved', draft: this.draft! })
+          const stagedBilling = this.billingDraft.size === 0
+            ? undefined
+            : Object.fromEntries(this.billingDraft)
+          this.done({
+            kind: 'saved',
+            draft: this.draft!,
+            ...(stagedBilling === undefined ? {} : { billing: stagedBilling }),
+          })
         } else if (id === 'discard') {
           this.done({ kind: 'discarded' })
         } else if (id.startsWith('backend-')) {
@@ -589,6 +671,61 @@ function uniqueProviders(
 export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   const service = new MultiProviderService()
   const store = new MultiAuthStore()
+
+  // Provider-level quota bookkeeping. Billing markings come from the store's
+  // providerQuota section; active blocks survive restarts via the same section.
+  const providerBilling = new Map<string, BillingPolicy>()
+  const quotaBlocks = new Map<string, { until: number; reason?: string }>()
+  const flaggedBackends = new Set<string>()
+  for (const [providerId, entry] of Object.entries(await store.listProviderQuota())) {
+    if (entry.billing !== undefined) providerBilling.set(providerId, entry.billing)
+    if (entry.blockedUntil !== undefined && entry.blockedUntil > Date.now()) {
+      quotaBlocks.set(providerId, {
+        until: entry.blockedUntil,
+        ...(entry.reason === undefined ? {} : { reason: entry.reason }),
+      })
+    }
+  }
+
+  const isProviderQuotaBlocked = (providerId: string): boolean => {
+    const block = quotaBlocks.get(providerId)
+    if (block === undefined) return false
+    if (block.until > Date.now()) return true
+    quotaBlocks.delete(providerId)
+    void store.clearProviderBlock(providerId).catch(() => undefined)
+    return false
+  }
+
+  const flagProviderQuotaBlock = async (providerId: string, failure: ProviderAttemptFailure): Promise<void> => {
+    if ((quotaBlocks.get(providerId)?.until ?? 0) > Date.now()) return
+    const policy = providerBilling.get(providerId)
+    const until = policy === undefined
+      ? Date.now() + SCHEDULER_DEFAULTS.quotaCooldownMs
+      : computeResetAt(policy, Date.now())
+    const reason = failure.message.slice(0, 300)
+    quotaBlocks.set(providerId, { until, reason })
+    try {
+      await store.blockProvider(providerId, until, reason)
+      currentContext?.ui.notify(
+        `multiprovider: provider "${providerId}" is quota-blocked until ${new Date(until).toLocaleString()}`
+          + (policy === undefined ? '' : ` (${policy.kind} billing)`),
+        'warning',
+      )
+    } catch {
+      // Persistence is best-effort; the in-memory block still applies.
+    }
+  }
+
+  const flagBackendIncompatible = (providerId: string, modelId: string, failure: ProviderAttemptFailure): void => {
+    const key = providerId + VIRTUAL_ID_SEPARATOR + modelId
+    if (flaggedBackends.has(key)) return
+    flaggedBackends.add(key)
+    currentContext?.ui.notify(
+      BACKEND_INCOMPATIBLE_PREFIX + ': "' + providerId + '/' + modelId + '" flagged for this session — '
+        + failure.message.slice(0, 160),
+      'warning',
+    )
+  }
   const externalIntegrations = new Map<string, AnyIntegration>()
   const managedIntegrations = new Map<string, AnyIntegration>()
   const managedBases = new Map<string, Provider<Api>>()
@@ -877,6 +1014,10 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         service,
         config,
         onFailover: handleFailover,
+        isProviderBlocked: isProviderQuotaBlocked,
+        onBackendQuotaFailure: (providerId, failure) => { void flagProviderQuotaBlock(providerId, failure) },
+        isModelFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
+        onBackendFatalMetadata: flagBackendIncompatible,
         getAffinityKey: () => sessionContext()?.sessionManager.getSessionId() ?? '',
         getBackingProvider: providerId =>
           installedProviders.get(providerId)
@@ -1459,6 +1600,13 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           candidates,
           isProviderIdAvailable: id => !virtualProviders.has(id) && ctx.modelRegistry.getProvider(id) === undefined,
           startDraft: existing === undefined ? undefined : structuredClone(existing),
+          providerBilling: providerId => providerBilling.get(providerId),
+          providerBlockUntil: providerId => quotaBlocks.get(providerId)?.until,
+          isBackendFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
+          clearProviderBlock: providerId => {
+            quotaBlocks.delete(providerId)
+            void store.clearProviderBlock(providerId).catch(() => undefined)
+          },
           done,
         }),
       )
@@ -1475,6 +1623,13 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         return
       }
       await store.saveVirtualProvider(outcome.draft)
+      if (outcome.billing !== undefined) {
+        for (const [providerId, policy] of Object.entries(outcome.billing)) {
+          await store.setProviderBilling(providerId, policy)
+          if (policy === undefined) providerBilling.delete(providerId)
+          else providerBilling.set(providerId, policy)
+        }
+      }
       await reconcile(ctx)
       const verb = stored.some(candidate => candidate.id === outcome.draft.id) ? 'Saved' : 'Created'
       ctx.ui.notify(`${verb} virtual provider "${outcome.draft.id}". Select "${outcome.draft.models[0]!.id}" on provider "${outcome.draft.id}" in /model.`, 'info')

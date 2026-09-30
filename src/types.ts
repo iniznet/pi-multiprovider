@@ -214,6 +214,31 @@ export interface VirtualProviderConfig {
   models: VirtualModelConfig[]
 }
 
+// How a backing provider replenishes the quota that a 402/429 exhausts. The
+// operator marks each provider with its billing reality; the scheduler uses
+// the kind to compute when a quota-blocked provider becomes usable again.
+export type BillingResetKind = 'daily' | 'weekly' | 'monthly' | 'hours'
+export const BILLING_RESET_KINDS: readonly BillingResetKind[] = [
+  'daily',
+  'weekly',
+  'monthly',
+  'hours',
+]
+
+export interface BillingPolicy {
+  kind: BillingResetKind
+  /** Rolling window length in hours; required (1-336) when kind is 'hours'. */
+  hours?: number
+}
+
+// Persisted quota bookkeeping for one backing provider: the operator-declared
+// billing policy plus the last automatic quota block.
+export interface ProviderQuotaState {
+  billing?: BillingPolicy
+  blockedUntil?: number
+  reason?: string
+}
+
 export const SCHEDULER_SETTING_KEYS = [
   'rateLimitCooldownMs',
   'quotaCooldownMs',

@@ -120,7 +120,11 @@ describe('MultiAuthStore', () => {
       authKind: 'api-key',
     })
     expect(JSON.stringify(pool)).not.toContain('test-secret')
-    expect((await stat(store.path)).mode & 0o777).toBe(0o600)
+    // POSIX mode bits do not exist on NTFS: every file reports 0666 and
+    // chmod is a no-op there, so the 0600 assertion only holds elsewhere.
+    if (process.platform !== 'win32') {
+      expect((await stat(store.path)).mode & 0o777).toBe(0o600)
+    }
     expect(await readFile(store.path, 'utf8')).toContain('test-secret-one')
   })
 

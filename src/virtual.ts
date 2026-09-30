@@ -20,9 +20,17 @@ import {
 } from './lift.ts'
 import { sessionAttributionHeaders } from './session-attribution.ts'
 import type { MultiProviderService } from './service.ts'
+import { isFatalMetadataFailure, isQuotaFailure } from './quota.ts'
+import {
+  resolveVirtualThinkingMap,
+  supportedThinkingLevels,
+  type ModelThinkingLevel,
+  type ThinkingSource,
+} from './thinking.ts'
 import type {
   AccountLease,
   FailoverInfo,
+  FailureDisposition,
   ProviderAttemptFailure,
   ProviderRegistration,
   SelectionBias,
@@ -43,6 +51,14 @@ const SAME_ACCOUNT_RETRY_DELAY_MS = 250
 // contain this separator: it composes scheduler ids and backend account ids.
 export const VIRTUAL_ID_SEPARATOR = '::'
 export const BACKEND_UNAVAILABLE_PREFIX = 'multiprovider: virtual backend unavailable'
+// A backend whose model metadata cannot serve the request (e.g. a thinking
+// level it does not support, or an upstream that rejects the model's declared
+// parameters). Retryable so the pool fails over; the extension flags the pair
+// so later requests skip it without spending an attempt.
+export const BACKEND_INCOMPATIBLE_PREFIX = 'multiprovider: virtual backend incompatible'
+// The backing provider is quota-blocked until its billing reset; selecting it
+// would only burn a scheduler attempt.
+export const BACKEND_QUOTA_BLOCKED_PREFIX = 'multiprovider: virtual backend quota-blocked'
 
 // Placeholder credential the virtual provider reports to the host so its
 // models pass auth-availability checks; real auth resolves per attempt at the
@@ -85,6 +101,14 @@ export interface VirtualProviderDependencies {
   isBackendConfigured?: (providerId: string) => boolean
   maxAccountAttempts?: number
   onFailover?: (info: FailoverInfo) => boolean | void
+  // Provider-level quota blocking (see src/quota.ts): blocked providers are
+  // skipped without an HTTP attempt until their billing reset.
+  isProviderBlocked?: (providerId: string) => boolean
+  onBackendQuotaFailure?: (providerId: string, failure: ProviderAttemptFailure) => void
+  // Per-(provider, model) incompatibility flags for permanent metadata
+  // rejections; flagged pairs are skipped for the rest of the process.
+  isModelFlagged?: (providerId: string, modelId: string) => boolean
+  onBackendFatalMetadata?: (providerId: string, modelId: string, failure: ProviderAttemptFailure) => void
 }
 
 export interface VirtualIntegrationOptions {
@@ -123,6 +147,14 @@ export function createVirtualIntegrations(
       ) {
         return { kind: 'transient' as const, retryable: true }
       }
+      if (failure.message.startsWith(BACKEND_INCOMPATIBLE_PREFIX)) {
+        return { kind: 'fatal' as const, retryable: true }
+      }
+      if (failure.message.startsWith(BACKEND_QUOTA_BLOCKED_PREFIX)) {
+        // The provider-level registry governs the duration; no scheduler
+        // cooldown on top of it.
+        return { kind: 'quota' as const, retryable: true, cooldownMs: 0 }
+      }
       return undefined
     },
     ...(options.maxAccountAttempts === undefined ? {} : { maxAccountAttempts: options.maxAccountAttempts }),
@@ -142,6 +174,29 @@ function resolveTarget(
     return BACKEND_UNAVAILABLE_PREFIX + ': provider "' + backend.providerId + '" has no model "' + backend.modelId + '"'
   }
   return { provider, model }
+}
+
+// Pre-flight rejections that must not spend an HTTP attempt: a provider under
+// a quota block, or a (provider, model) pair already flagged incompatible.
+function skipFailureFor(
+  dependencies: VirtualProviderDependencies,
+  backend: VirtualBackend,
+): ProviderAttemptFailure | undefined {
+  if (dependencies.isModelFlagged?.(backend.providerId, backend.modelId) === true) {
+    return {
+      message: BACKEND_INCOMPATIBLE_PREFIX + ': "' + backend.providerId + '/' + backend.modelId
+        + '" was flagged incompatible earlier in this session',
+      outputStarted: false,
+    }
+  }
+  if (dependencies.isProviderBlocked?.(backend.providerId) === true) {
+    return {
+      message: BACKEND_QUOTA_BLOCKED_PREFIX + ': provider "' + backend.providerId
+        + '" is blocked until its quota reset',
+      outputStarted: false,
+    }
+  }
+  return undefined
 }
 
 function virtualStream<TApi extends Api>(
@@ -208,14 +263,54 @@ function virtualStream<TApi extends Api>(
         let leaseOutcome: 'next-account' | 'surface' | undefined
         let sameAccountErrors = 0
 
+        const skipFailure = skipFailureFor(dependencies, backend)
+        if (skipFailure !== undefined) {
+          lastSetupError = new Error(skipFailure.message)
+          const disposition = lease.release({ status: 'failure', error: skipFailure })
+          settled = true
+          if (disposition?.retryable && attempts < maxAttempts && !signal.aborted) continue
+          throw lastSetupError
+        }
+
+        // Central failure release: feeds the provider-level quota registry and
+        // the per-model incompatibility flags before failover continues.
+        const releaseFailure = (failure: ProviderAttemptFailure): FailureDisposition | undefined => {
+          const disposition = lease.release({ status: 'failure', error: failure })
+          if (disposition?.kind === 'quota' || isQuotaFailure(failure)) {
+            dependencies.onBackendQuotaFailure?.(backend.providerId, failure)
+          } else if (disposition?.kind === 'fatal' && isFatalMetadataFailure(failure)) {
+            dependencies.onBackendFatalMetadata?.(backend.providerId, backend.modelId, failure)
+          }
+          return disposition
+        }
+
         try {
           const target = resolveTarget(dependencies, backend)
           if (typeof target === 'string') {
             lastSetupError = new Error(target)
-            const disposition = lease.release({
-              status: 'failure',
-              error: { message: target, outputStarted: false },
-            })
+            const disposition = releaseFailure({ message: target, outputStarted: false })
+            settled = true
+            if (disposition?.retryable && attempts < maxAttempts && !signal.aborted) continue
+            throw lastSetupError
+          }
+
+          // The request's thinking level must be one the backing model can
+          // actually serve; the advertised virtual map is an intersection, but
+          // live metadata can diverge from the captured template.
+          const requestedLevel = typeof requestOptions.reasoningEffort === 'string'
+            && requestOptions.reasoningEffort !== 'off'
+            ? requestOptions.reasoningEffort as ModelThinkingLevel
+            : undefined
+          if (requestedLevel !== undefined && target.model.reasoning
+            && !supportedThinkingLevels(target.model).has(requestedLevel)) {
+            const failure: ProviderAttemptFailure = {
+              message: BACKEND_INCOMPATIBLE_PREFIX + ': "' + backend.providerId + '/' + backend.modelId
+                + '" does not support thinking level "' + requestedLevel + '"',
+              outputStarted: false,
+            }
+            dependencies.onBackendFatalMetadata?.(backend.providerId, backend.modelId, failure)
+            lastSetupError = new Error(failure.message)
+            const disposition = releaseFailure(failure)
             settled = true
             if (disposition?.retryable && attempts < maxAttempts && !signal.aborted) continue
             throw lastSetupError
@@ -304,7 +399,7 @@ function virtualStream<TApi extends Api>(
                     retriedSameAccount = true
                     break
                   }
-                  const disposition = lease.release({ status: 'failure', error: failure })
+                  const disposition = releaseFailure(failure)
                   settled = true
                   if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
                     lastTerminal = {
@@ -351,10 +446,7 @@ function virtualStream<TApi extends Api>(
           if (!settled) {
             const error = new Error('Provider stream ended without a terminal event')
             lastSetupError = error
-            const disposition = lease.release({
-              status: 'failure',
-              error: failureFrom(error, response, outputStarted),
-            })
+            const disposition = releaseFailure(failureFrom(error, response, outputStarted))
             settled = true
             if (!outputStarted && disposition?.retryable && attempts < maxAttempts) continue
             throw error
@@ -363,10 +455,7 @@ function virtualStream<TApi extends Api>(
           if (!settled) {
             const disposition = signal.aborted
               ? lease.release({ status: 'cancelled' })
-              : lease.release({
-                  status: 'failure',
-                  error: failureFrom(error, response, outputStarted),
-                })
+              : releaseFailure(failureFrom(error, response, outputStarted))
             settled = true
             if (!outputStarted && disposition?.retryable && attempts < maxAttempts) {
               lastSetupError = error
@@ -435,35 +524,35 @@ export function createVirtualProvider(dependencies: VirtualProviderDependencies)
   const { config } = dependencies
 
   const virtualModel = (model: VirtualModelConfig): Model<Api> => {
-    let template: Model<Api> | undefined
+    const sources: (Model<Api> | VirtualModelTemplate)[] = []
     for (const backend of model.backends) {
       if (backend.enabled === false) continue
       const candidate = dependencies
         .getBackingProvider(backend.providerId)
         ?.getModels()
         .find(item => item.id === backend.modelId)
-      if (candidate !== undefined) {
-        template = candidate
-        break
-      }
+      const source = candidate ?? backend.template
+      if (source !== undefined) sources.push(source)
     }
     // Live backings win. Before they register (extension load, when pi already
-    // snapshots enabled/resumed-session models), fall back to the template
+    // snapshots enabled/resumed-session models), fall back to the templates
     // captured at backend-pick time so thinking support and context metadata
     // do not depend on provider registration order.
-    const source: Model<Api> | VirtualModelTemplate | undefined = template
-      ?? model.backends.find(backend => backend.enabled !== false && backend.template !== undefined)
-        ?.template
+    const source = sources[0]
+    // The advertised thinking map is the intersection across ALL enabled
+    // backends, resolved in the operator's preference order (high > medium >
+    // xhigh > low > max): pi clamps its default level against this map, so a
+    // single-backend copy would let requests reach backends that reject the
+    // level outright.
+    const thinkingLevelMap = resolveVirtualThinkingMap(sources)
     return {
       id: model.id,
       name: model.label ?? model.id,
       api: source?.api ?? 'openai-completions',
       provider: config.id,
       baseUrl: source?.baseUrl ?? '',
-      reasoning: source?.reasoning ?? false,
-      ...(source?.thinkingLevelMap === undefined
-        ? {}
-        : { thinkingLevelMap: source.thinkingLevelMap }),
+      reasoning: sources.some(item => item.reasoning),
+      ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
       input: source?.input ?? ['text'],
       cost: source?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: source?.contextWindow ?? 128_000,
