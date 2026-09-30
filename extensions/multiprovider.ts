@@ -42,6 +42,7 @@ import {
   PI_UPSTREAM_ACCOUNT_ID,
   SCHEDULER_DEFAULTS,
   VIRTUAL_ID_SEPARATOR,
+  type AccountUsageSnapshot,
   type BillingPolicy,
   type ProviderAttemptFailure,
   type MultiAuthUpstreamPreferences,
@@ -152,6 +153,7 @@ class VirtualProviderEditorDialog extends Container {
   private readonly billingDraft = new Map<string, BillingPolicy | undefined>()
   private readonly providerBilling: (providerId: string) => BillingPolicy | undefined
   private readonly providerBlockUntil: (providerId: string) => number | undefined
+  private readonly accountUsage: (providerId: string) => string | undefined
   private readonly isBackendFlagged: (providerId: string, modelId: string) => boolean
   private readonly clearProviderBlock: (providerId: string) => void
   private readonly pageContainer = new Container()
@@ -177,6 +179,7 @@ class VirtualProviderEditorDialog extends Container {
     startDraft: VirtualProviderConfig | undefined
     providerBilling?: (providerId: string) => BillingPolicy | undefined
     providerBlockUntil?: (providerId: string) => number | undefined
+    accountUsage?: (providerId: string) => string | undefined
     isBackendFlagged?: (providerId: string, modelId: string) => boolean
     clearProviderBlock?: (providerId: string) => void
     done: (outcome: VirtualEditorOutcome) => void
@@ -188,6 +191,7 @@ class VirtualProviderEditorDialog extends Container {
     this.isProviderIdAvailable = options.isProviderIdAvailable
     this.providerBilling = options.providerBilling ?? (() => undefined)
     this.providerBlockUntil = options.providerBlockUntil ?? (() => undefined)
+    this.accountUsage = options.accountUsage ?? (() => undefined)
     this.isBackendFlagged = options.isBackendFlagged ?? (() => false)
     this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
     this.done = options.done
@@ -355,13 +359,15 @@ class VirtualProviderEditorDialog extends Container {
       ...model.backends.map((backend, index) => {
         const blocked = (this.providerBlockUntil(backend.providerId) ?? 0) > Date.now()
         const flagged = this.isBackendFlagged(backend.providerId, backend.modelId)
+        const usage = this.accountUsage(backend.providerId)
         return this.menuItem(
           `backend-${index}`,
           `${index + 1}. ${backend.providerId}`
             + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`
               + (backend.priority === undefined ? '' : ` · p${backend.priority}`)
               + (blocked ? ' · quota-blocked' : '')
-              + (flagged ? ' · flagged' : '')),
+              + (flagged ? ' · flagged' : '')
+              + (usage === undefined ? '' : ` · ${usage}`)),
         )
       }),
       this.separatorItem('sep-bottom'),
@@ -651,7 +657,33 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function statusLines(snapshot: Awaited<ReturnType<MultiProviderService['snapshot']>>): string[] {
+// '2h14m' / '3d20h' / '45m' — compact countdown for usage-window resets.
+function formatDuration(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000))
+  const days = Math.floor(minutes / 1440)
+  const hours = Math.floor((minutes % 1440) / 60)
+  const mins = minutes % 60
+  if (days > 0) return days + 'd' + hours + 'h'
+  if (hours > 0) return hours + 'h' + (mins > 0 ? String(mins) + 'm' : '')
+  return mins + 'm'
+}
+
+// '5h: 63% · 7d: 41% · 30d: 12% ↺ 20d0h' — remaining budget per window with a
+// reset countdown only on exhausted windows.
+function formatUsageSummary(snapshot: AccountUsageSnapshot): string {
+  return snapshot.windows.map(window => {
+    let text = window.label + ': ' + window.remainingPercent + '%'
+    if (window.rateLimited && window.resetsAt !== null) {
+      text += ' ↺ ' + formatDuration(window.resetsAt - Date.now())
+    }
+    return text
+  }).join(' · ')
+}
+
+function statusLines(
+  snapshot: Awaited<ReturnType<MultiProviderService['snapshot']>>,
+  accountUsage?: (providerId: string, accountId: string) => string | undefined,
+): string[] {
   const lines: string[] = []
   for (const provider of snapshot.providers) {
     lines.push(
@@ -667,8 +699,10 @@ function statusLines(snapshot: Awaited<ReturnType<MultiProviderService['snapshot
       const cooldown = account.cooldownUntil === undefined
         ? ''
         : ` · cooldown until ${new Date(account.cooldownUntil).toLocaleTimeString()}`
+      const usage = accountUsage?.(provider.id, account.id)
       lines.push(
-        `  ${account.label} (${account.authKind}) · ${account.status} · w${account.weight} · p${account.priority} · ${account.inFlight} in flight · ${account.consecutiveFailures} failures${cooldown}`,
+        `  ${account.label} (${account.authKind}) · ${account.status} · w${account.weight} · p${account.priority} · ${account.inFlight} in flight · ${account.consecutiveFailures} failures${cooldown}`
+          + (usage === undefined ? '' : ` · ${usage}`),
       )
     }
   }
@@ -1606,7 +1640,10 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         ctx.ui.notify('No account pools are configured. Use /multilogin to add one.', 'info')
         return
       }
-      await ctx.ui.select('Provider Accounts', statusLines(snapshot))
+      await ctx.ui.select('Provider Accounts', statusLines(snapshot, (providerId, accountId) => {
+        const found = usageCache.snapshots(providerId).find(item => item.accountId === accountId)
+        return found === undefined ? undefined : formatUsageSummary(found.snapshot)
+      }))
     },
   })
 
@@ -1772,6 +1809,19 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           startDraft: existing === undefined ? undefined : structuredClone(existing),
           providerBilling: providerId => providerBilling.get(providerId),
           providerBlockUntil: providerId => quotaBlocks.get(providerId)?.until,
+          accountUsage: providerId => {
+            const snapshots = usageCache.snapshots(providerId)
+            if (snapshots.length === 0) return undefined
+            // Most constrained account: the one with the least remaining
+            // budget anywhere, so a row summarizes the pool's worst case.
+            const worst = snapshots
+              .map(({ snapshot }) => ({
+                snapshot,
+                remaining: Math.min(...snapshot.windows.map(window => window.remainingPercent)),
+              }))
+              .sort((left, right) => left.remaining - right.remaining)[0]!
+            return formatUsageSummary(worst.snapshot)
+          },
           isBackendFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
           clearProviderBlock: providerId => {
             quotaBlocks.delete(providerId)
