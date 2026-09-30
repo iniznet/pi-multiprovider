@@ -837,8 +837,10 @@ describe('virtual providers', () => {
     })
   })
 
-  it('skips backends that cannot serve the requested thinking level', async () => {
-    // prov-a's model only maps low/medium; a request at high must not reach it.
+  it('degrades the requested level instead of filtering backends out', async () => {
+    // prov-a's model only maps low/medium. Selection must not filter on that:
+    // the strategy picks, and the request's level moves to the nearest level
+    // the picked backend can serve.
     const limitedA: Model<'test-api'> = {
       ...modelA,
       reasoning: true,
@@ -850,8 +852,11 @@ describe('virtual providers', () => {
       thinkingLevelMap: { off: null, low: 'low', medium: 'medium', high: 'high' },
     }
     const httpAttempts: string[] = []
+    const sentEfforts: Array<string | undefined> = []
+    const served: VirtualServedInfo[] = []
     const flagged: string[] = []
-    const served: string[] = []
+    const effortOf = (options?: SimpleStreamOptions): string | undefined =>
+      (options as { reasoningEffort?: string } | undefined)?.reasoningEffort
     const service = new MultiProviderService({ randomInt: () => 0 })
     for (const integration of createVirtualIntegrations(config)) service.registerProvider(integration)
     const virtual = createVirtualProvider({
@@ -860,24 +865,42 @@ describe('virtual providers', () => {
       getAffinityKey: () => 'session-1',
       getBackingProvider: providerId =>
         providerId === 'prov-a'
-          ? backend('prov-a', limitedA, model => { httpAttempts.push(model.provider + '/' + model.id); return okStream('from-a') })
-          : backend('prov-b', reasoningB, model => { httpAttempts.push(model.provider + '/' + model.id); return okStream('from-b') }),
+          ? backend('prov-a', limitedA, (model, _context, options) => {
+            httpAttempts.push('prov-a/model-a')
+            sentEfforts.push(effortOf(options))
+            return okStream('from-a')
+          })
+          : backend('prov-b', reasoningB, (model, _context, options) => {
+            httpAttempts.push('prov-b/model-b')
+            sentEfforts.push(effortOf(options))
+            return okStream('from-b')
+          }),
       resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
-      onBackendFatalMetadata: (providerId, modelId) => flagged.push(providerId + '/' + modelId),
-      onBackendServed: info => { served.push(info.providerId + '/' + info.modelId) },
+      onBackendFatalMetadata: (providerId, modelId, level) => {
+        flagged.push(providerId + '/' + modelId + '@' + (level ?? 'any'))
+      },
+      onBackendServed: info => { served.push(info) },
     })
-    const events = await collect(virtual.stream(virtual.getModels()[0]!, context, { reasoningEffort: 'high' }))
-    // prov-a/model-a cannot serve high: skipped without an HTTP attempt;
-    // prov-b/model-b (reasoning true, high supported) serves. The mismatch is
-    // request-scoped, so the pair must NOT be flagged permanently — a later
-    // request at 'medium' should still be able to use prov-a.
-    expect(httpAttempts).toEqual(['prov-b/model-b'])
-    expect(flagged).toEqual([])
-    // A backend skipped pre-flight was never dispatched, so it is not
-    // reported as serving.
-    expect(served).toEqual(['prov-b/model-b'])
+    const model = virtual.getModels()[0]!
+    // Unbiased rotation picks prov-a first, and prov-a cannot serve 'high'.
+    const events = await collect(virtual.stream(model, context, { reasoningEffort: 'high' }))
     expect(events.at(-1)).toMatchObject({ type: 'done' })
+    expect(httpAttempts).toEqual(['prov-a/model-a'])
+    // 'medium' is the nearest level prov-a maps below the requested 'high'.
+    expect(sentEfforts).toEqual(['medium'])
+    // A degraded request is not a rejection, so nothing gets flagged.
+    expect(flagged).toEqual([])
+    expect(served[0]).toMatchObject({
+      providerId: 'prov-a',
+      requestedLevel: 'high',
+      servedLevel: 'medium',
+    })
+    // A level the backend does serve is sent untouched.
+    await collect(virtual.stream(model, context, { reasoningEffort: 'low' }))
+    expect(sentEfforts).toEqual(['medium', 'low'])
+    expect(served.at(-1)).toMatchObject({ requestedLevel: 'low', servedLevel: 'low' })
   })
+
 
   it('reports which backend a request is dispatched to, including failovers', async () => {
     const served: VirtualServedInfo[] = []
@@ -964,6 +987,42 @@ describe('virtual providers', () => {
     const last = events.at(-1)!
     expect(last).toMatchObject({ type: 'error' })
     if (last.type === 'error') expect(last.error.errorMessage).toMatch(/quota-blocked/)
+  })
+
+  it('does not let a rejected level evict the pair at other levels', async () => {
+    const flagged = new Set<string>()
+    const { virtual, attempts } = harness(
+      {
+        a: (_model, _context, options) => (options as { reasoningEffort?: string } | undefined)?.reasoningEffort === 'high'
+          ? errorStream('400: {"message":"native reasoning control reasoning_effort is not allowed"}')
+          : okStream('from-a'),
+        b: () => okStream('from-b'),
+      },
+      {},
+      {
+        errorsBeforeSwitch: 1,
+        deps: {
+          isModelFlagged: (providerId, modelId, level) =>
+            flagged.has(providerId + '/' + modelId + '@any')
+            || (level !== undefined && flagged.has(providerId + '/' + modelId + '@' + level)),
+          onBackendFatalMetadata: (providerId, modelId, level) => {
+            flagged.add(providerId + '/' + modelId + '@' + (level ?? 'any'))
+          },
+        },
+      },
+    )
+    const model = virtual.getModels()[0]!
+    // prov-a is picked first and rejects 'high'. The rejection is fatal, so the
+    // request surfaces instead of failing over.
+    await collect(virtual.stream(model, context, { reasoningEffort: 'high', sessionId: 's1' }))
+    expect([...flagged]).toEqual(['prov-a/model-a@high'])
+    // The same session at a level prov-a was never rejected at still uses it:
+    // a flat pair flag used to evict the backend from the pool for every level.
+    await collect(virtual.stream(model, context, { reasoningEffort: 'low', sessionId: 's1' }))
+    expect(attempts.map(attempt => attempt.provider)).toEqual(['prov-a', 'prov-a'])
+    // Back at the rejected level the pair is skipped without an HTTP attempt.
+    await collect(virtual.stream(model, context, { reasoningEffort: 'high', sessionId: 's1' }))
+    expect(attempts.map(attempt => attempt.provider)).toEqual(['prov-a', 'prov-a', 'prov-b'])
   })
 
   it('flags fatal metadata errors and skips the flagged pair afterwards', async () => {

@@ -270,6 +270,26 @@ describe('MultiProviderService', () => {
     expect(() => service.updateSchedulerDefaults({ rateLimitCooldownMs: -1 })).toThrow('non-negative')
   })
 
+  it('lists every session attached to a pool, implicit and explicit', async () => {
+    const service = scheduler()
+    await service.acquire({ providerId: 'example', affinityKey: 'session-1' })
+    await service.acquire({ providerId: 'example', affinityKey: 'session-2' })
+    await service.pinAccount('example', 'session-3', 'b')
+    expect(service.affinityEntries('example')).toEqual([
+      { key: 'session-1', accountId: 'a', explicit: false },
+      { key: 'session-2', accountId: 'a', explicit: false },
+      { key: 'session-3', accountId: 'b', explicit: true },
+    ])
+    // An acquire without a key is a probe, not a session: the early pick runs
+    // the strategy through it and must leave no attachment behind.
+    const probe = await service.acquire({ providerId: 'example' })
+    probe.release()
+    expect(service.affinityEntries('example')).toHaveLength(3)
+    // Completion calls this speculatively mid-typing: unknown pools are empty,
+    // not an exception.
+    expect(service.affinityEntries('no-such-pool')).toEqual([])
+  })
+
   it('pins an explicit session account that survives exclusions and cooldowns', async () => {
     let now = 1_000
     const service = scheduler({ now: () => now })

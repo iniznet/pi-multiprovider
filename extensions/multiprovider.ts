@@ -45,6 +45,11 @@ import {
   type AccountUsageSnapshot,
   type BillingPolicy,
   type ProviderAttemptFailure,
+  type ModelThinkingLevel,
+  type PublicPoolSnapshot,
+  type AffinityEntry,
+  pickSuggestions,
+  sessionsOn,
   type MultiAuthUpstreamPreferences,
   type MultiProviderIntegration,
   type MultiProviderServiceContext,
@@ -154,7 +159,7 @@ class VirtualProviderEditorDialog extends Container {
   private readonly providerBilling: (providerId: string) => BillingPolicy | undefined
   private readonly providerBlockUntil: (providerId: string) => number | undefined
   private readonly accountUsage: (providerId: string) => string | undefined
-  private readonly isBackendFlagged: (providerId: string, modelId: string) => boolean
+  private readonly flaggedLevels: (providerId: string, modelId: string) => string[]
   private readonly clearProviderBlock: (providerId: string) => void
   private readonly pageContainer = new Container()
   private readonly listTheme: SettingsListTheme
@@ -180,7 +185,7 @@ class VirtualProviderEditorDialog extends Container {
     providerBilling?: (providerId: string) => BillingPolicy | undefined
     providerBlockUntil?: (providerId: string) => number | undefined
     accountUsage?: (providerId: string) => string | undefined
-    isBackendFlagged?: (providerId: string, modelId: string) => boolean
+    flaggedLevels?: (providerId: string, modelId: string) => string[]
     clearProviderBlock?: (providerId: string) => void
     done: (outcome: VirtualEditorOutcome) => void
   }) {
@@ -192,7 +197,7 @@ class VirtualProviderEditorDialog extends Container {
     this.providerBilling = options.providerBilling ?? (() => undefined)
     this.providerBlockUntil = options.providerBlockUntil ?? (() => undefined)
     this.accountUsage = options.accountUsage ?? (() => undefined)
-    this.isBackendFlagged = options.isBackendFlagged ?? (() => false)
+    this.flaggedLevels = options.flaggedLevels ?? (() => [])
     this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
     this.done = options.done
     this.draft = options.startDraft
@@ -360,7 +365,8 @@ class VirtualProviderEditorDialog extends Container {
       this.separatorItem('sep-top'),
       ...model.backends.map((backend, index) => {
         const blocked = (this.providerBlockUntil(backend.providerId) ?? 0) > Date.now()
-        const flagged = this.isBackendFlagged(backend.providerId, backend.modelId)
+        const flags = this.flaggedLevels(backend.providerId, backend.modelId)
+        const flagged = flags.length > 0
         const usage = this.accountUsage(backend.providerId)
         return this.menuItem(
           `backend-${index}`,
@@ -368,7 +374,7 @@ class VirtualProviderEditorDialog extends Container {
             + this.theme.fg('dim', ` · ${backend.modelId} · ${backend.enabled === false ? 'disabled' : 'enabled'} · w${backend.weight ?? 1}`
               + (backend.priority === undefined ? '' : ` · p${backend.priority}`)
               + (blocked ? ' · quota-blocked' : '')
-              + (flagged ? ' · flagged' : '')
+              + (flagged ? ' · flagged(' + flags.join(',') + ')' : '')
               + (usage === undefined ? '' : ` · ${usage}`)),
         )
       }),
@@ -720,10 +726,18 @@ function statusLines(
 
 const AUTOMATIC_SWITCH_REFS = new Set(['auto', 'automatic'])
 
+// Runs the pool's configured strategy immediately and keeps its answer, so an
+// operator can see where a session will land before spending a request on it.
+const PICK_STRATEGY_REF = 'pick'
+
 // Ids compose into scheduler ids and backend account ids via '::' separators.
 const VIRTUAL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/i
 
-function switchAccountLabel(account: PublicAccountSnapshot, current: boolean): string {
+function switchAccountLabel(
+  account: PublicAccountSnapshot,
+  current: boolean,
+  attached?: string,
+): string {
   const kind = account.id === PI_UPSTREAM_ACCOUNT_ID ? 'upstream' : account.authKind
   const status = account.status === 'cooldown' && account.cooldownUntil !== undefined
     ? `cooldown until ${new Date(account.cooldownUntil).toLocaleTimeString()}`
@@ -733,14 +747,19 @@ function switchAccountLabel(account: PublicAccountSnapshot, current: boolean): s
     status,
     `w${account.weight} · p${account.priority}`,
     ...(current ? ['current'] : []),
+    // Which sessions already sit on this account: the difference between
+    // "somewhere idle" and "everyone lands here".
+    attached ?? 'no sessions',
   ].join(' · ')
 }
 
 function switchAccountLabels(
   accounts: readonly PublicAccountSnapshot[],
   currentId: string | undefined,
+  attachedOf?: (accountId: string) => string | undefined,
 ): string[] {
-  const labels = accounts.map(account => switchAccountLabel(account, account.id === currentId))
+  const labels = accounts.map(account =>
+    switchAccountLabel(account, account.id === currentId, attachedOf?.(account.id)))
   const counts = new Map<string, number>()
   for (const label of labels) counts.set(label, (counts.get(label) ?? 0) + 1)
   return labels.map((label, index) =>
@@ -929,13 +948,47 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     }
   }
 
-  const flagBackendIncompatible = (providerId: string, modelId: string, failure: ProviderAttemptFailure): void => {
-    const key = providerId + VIRTUAL_ID_SEPARATOR + modelId
+  // A rejected (provider, model, level) triple. The level is part of the key
+  // on purpose: a backend that refuses `max` is still perfectly usable at
+  // `low`, and a flat pair key used to evict it from the pool for every level
+  // for the rest of the process — which made an unbiased pool look like it was
+  // ignoring its strategy. A rejection with no thinking level in play means the
+  // upstream refuses reasoning control outright, so no level is worth trying.
+  const flagKey = (providerId: string, modelId: string, level: ModelThinkingLevel | undefined): string =>
+    providerId + VIRTUAL_ID_SEPARATOR + modelId + VIRTUAL_ID_SEPARATOR + (level ?? 'any')
+
+  const isFlaggedAt = (
+    providerId: string,
+    modelId: string,
+    level: ModelThinkingLevel | undefined,
+  ): boolean =>
+    flaggedBackends.has(flagKey(providerId, modelId, undefined))
+    || (level !== undefined && flaggedBackends.has(flagKey(providerId, modelId, level)))
+
+  // Levels a pair is known to reject, for surfaces that list backends.
+  const flaggedLevelsFor = (providerId: string, modelId: string): string[] => {
+    const prefix = providerId + VIRTUAL_ID_SEPARATOR + modelId + VIRTUAL_ID_SEPARATOR
+    const levels: string[] = []
+    for (const key of flaggedBackends) {
+      if (!key.startsWith(prefix)) continue
+      levels.push(key.slice(prefix.length))
+    }
+    return levels.sort()
+  }
+
+  const flagBackendIncompatible = (
+    providerId: string,
+    modelId: string,
+    level: ModelThinkingLevel | undefined,
+    failure: ProviderAttemptFailure,
+  ): void => {
+    const key = flagKey(providerId, modelId, level)
     if (flaggedBackends.has(key)) return
     flaggedBackends.add(key)
     currentContext?.ui.notify(
-      BACKEND_INCOMPATIBLE_PREFIX + ': "' + providerId + '/' + modelId + '" flagged for this session — '
-        + failure.message.slice(0, 160),
+      BACKEND_INCOMPATIBLE_PREFIX + ': "' + providerId + '/' + modelId + '" flagged for '
+        + (level === undefined ? 'any thinking level' : 'level "' + level + '"')
+        + ' this session — ' + failure.message.slice(0, 160),
       'warning',
     )
   }
@@ -960,7 +1013,15 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   // dispatched would otherwise be invisible. One line above the editor names
   // who serves the turn, refreshed at dispatch time (so a failover repaints).
   const SERVING_WIDGET_KEY = 'multiprovider:serving'
-  const servedBackends = new Map<string, { providerId: string; modelId: string; accountId?: string }>()
+  interface ServedBackend {
+    providerId: string
+    modelId: string
+    accountId?: string
+    requestedLevel?: ModelThinkingLevel
+    servedLevel?: ModelThinkingLevel
+  }
+
+  const servedBackends = new Map<string, ServedBackend>()
   const accountLabels = new Map<string, string>()
   let servingWidgetEnabled = true
 
@@ -1015,7 +1076,14 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     const account = served.accountId === undefined
       ? undefined
       : accountLabels.get(served.providerId + VIRTUAL_ID_SEPARATOR + served.accountId)
-    return `\u21b3 serving ${providerName} \u00b7 ${served.modelId}` + (account === undefined ? '' : ` \u00b7 ${account}`)
+    // A degraded level is worth naming: the operator asked for one thing and
+    // the picked backend serves another, and that is invisible in pi's footer.
+    const level = served.servedLevel === undefined || served.servedLevel === served.requestedLevel
+      ? ''
+      : ` · ${served.requestedLevel}→${served.servedLevel}`
+    return `\u21b3 serving ${providerName} \u00b7 ${served.modelId}`
+      + level
+      + (account === undefined ? '' : ` \u00b7 ${account}`)
   }
 
   const renderServingWidget = (ctx: ExtensionContext): void => {
@@ -1307,12 +1375,14 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         onFailover: handleFailover,
         isProviderBlocked: isProviderQuotaBlocked,
         onBackendQuotaFailure: (providerId, failure) => { void flagProviderQuotaBlock(providerId, failure) },
-        isModelFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
+        isModelFlagged: (providerId, modelId, level) => isFlaggedAt(providerId, modelId, level),
         onBackendFatalMetadata: flagBackendIncompatible,
         onBackendServed: info => {
           servedBackends.set(servedKey(info.virtualProviderId, info.virtualModelId), {
             providerId: info.providerId,
             modelId: info.modelId,
+            ...(info.requestedLevel === undefined ? {} : { requestedLevel: info.requestedLevel }),
+            ...(info.servedLevel === undefined ? {} : { servedLevel: info.servedLevel }),
             ...servedAccount(info.providerId),
           })
           const ctx = currentContext
@@ -1775,65 +1845,97 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     },
   })
 
+  // Everything the switch command needs about the current model's pool, resolved
+  // identically for the interactive menu, a typed argument, and the editor's
+  // argument completions. Failures come back as a message so each surface
+  // decides how loudly to report it — a completion list stays silent, the
+  // command explains.
+  interface SwitchTarget {
+    poolId: string
+    providerName: string
+    pool: PublicPoolSnapshot
+    switchable: PublicAccountSnapshot[]
+    affinityKey: string
+    currentId: string | undefined
+  }
+
+  const resolveSwitchTarget = async (ctx: ExtensionContext): Promise<SwitchTarget | { message: string }> => {
+    const model = ctx.model
+    if (model === undefined) return { message: 'No model is selected.' }
+    const providerId = model.provider
+    const virtual = virtualIntegrations.get(virtualSchedulerId(providerId, model.id))
+    const integration = virtual ?? effectiveIntegration(providerId)
+    const poolId = virtual !== undefined ? virtual.id : providerId
+    const providerName = virtual !== undefined
+      ? `${virtualProviders.get(providerId)?.name ?? providerId} · ${model.name}`
+      : ctx.modelRegistry.getProvider(providerId)?.name ?? providerId
+    const pool = integration === undefined
+      ? undefined
+      : (await service.snapshot()).providers.find(candidate => candidate.id === poolId)
+    if (integration === undefined) {
+      // No stored pool exists: ambient auth (Pi /login, auth.json, environment)
+      // still resolves per request, there is just nothing to switch between.
+      const configured = probeSessionRuntime(ctx)?.getProviderAuthStatus(providerId)?.configured !== false
+      return {
+        message: `${providerName} has no multiprovider pool. ${
+          configured
+            ? 'Its ambient credential (Pi /login, auth.json, or environment) is used directly.'
+            : 'No ambient credential is configured either.'
+        } Run /multilogin ${poolId} to add pooled accounts.`,
+      }
+    }
+    const accounts = pool?.accounts ?? []
+    if (pool === undefined || accounts.length === 0) {
+      return { message: `${providerName} has an empty pool. Use /multilogin to add one.` }
+    }
+    // The upstream account is excluded from attempts while Pi has no credential
+    // configured for it, so pinning it then would never apply.
+    const upstreamConfigured = probeSessionRuntime(ctx)
+      ?.getProviderAuthStatus(providerId)?.configured !== false
+    const switchable = accounts.filter(account =>
+      account.id !== PI_UPSTREAM_ACCOUNT_ID || upstreamConfigured)
+    if (switchable.length === 0) {
+      return { message: `No switchable accounts for ${providerName}. Use /multilogin to add one.` }
+    }
+    const affinityKey = sessionAffinityKey(integration, ctx, model, providerId)
+    const pin = service.getAffinity(poolId, affinityKey)
+    const currentId = pin !== undefined && (pool.affinity || pin.explicit) ? pin.accountId : undefined
+    return { poolId, providerName, pool, switchable, affinityKey, currentId }
+  }
+
+  const switchAccountCompletions = async (argumentPrefix: string) => {
+    const ctx = currentContext
+    if (ctx === undefined) return null
+    const target = await resolveSwitchTarget(ctx)
+    if ('message' in target) return null
+    const items = pickSuggestions({
+      candidates: target.switchable.map(account => ({
+        id: account.id,
+        label: account.label,
+        detail: account.id === PI_UPSTREAM_ACCOUNT_ID
+          ? 'upstream'
+          : account.status === 'cooldown' ? 'cooling down' : account.authKind,
+      })),
+      pins: service.affinityEntries(target.poolId),
+      currentKey: target.affinityKey,
+      currentId: target.currentId,
+      policy: target.pool.policy,
+    })
+    const normalized = argumentPrefix.trim().toLowerCase()
+    if (normalized === '') return items
+    return items.filter(item => item.label.toLowerCase().startsWith(normalized))
+  }
+
   pi.registerCommand('switch-account', {
     description: 'Switch the pooled account used by the current model for this session',
     handler: async (args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify('/switch-account requires Pi interactive mode.', 'warning')
-        return
-      }
       await reconcile(ctx)
-      const model = ctx.model
-      if (model === undefined) {
-        ctx.ui.notify('No model is selected.', 'info')
+      const target = await resolveSwitchTarget(ctx)
+      if ('message' in target) {
+        ctx.ui.notify(target.message, 'info')
         return
       }
-      const providerId = model.provider
-      const virtual = virtualIntegrations.get(virtualSchedulerId(providerId, model.id))
-      const integration = virtual ?? effectiveIntegration(providerId)
-      const poolId = virtual !== undefined ? virtual.id : providerId
-      const providerName = virtual !== undefined
-        ? `${virtualProviders.get(providerId)?.name ?? providerId} · ${model.name}`
-        : ctx.modelRegistry.getProvider(providerId)?.name ?? providerId
-      const pool = integration === undefined
-        ? undefined
-        : (await service.snapshot()).providers.find(candidate => candidate.id === poolId)
-      const accounts = pool?.accounts ?? []
-      // The upstream account is excluded from attempts while Pi has no
-      // credential configured for it, so pinning it then would never apply.
-      const upstreamConfigured = probeSessionRuntime(ctx)
-        ?.getProviderAuthStatus(providerId)?.configured !== false
-      if (integration === undefined) {
-        // No stored pool exists: ambient auth (Pi /login, auth.json,
-        // environment) still resolves per request, there is just nothing to
-        // switch between. Say so instead of implying auth is broken.
-        ctx.ui.notify(
-          `${providerName} has no multiprovider pool. ${
-            upstreamConfigured
-              ? 'Its ambient credential (Pi /login, auth.json, or environment) is used directly.'
-              : 'No ambient credential is configured either.'
-          } Run /multilogin ${poolId} to add pooled accounts.`,
-          'info',
-        )
-        return
-      }
-      if (pool === undefined || accounts.length === 0) {
-        ctx.ui.notify(`${providerName} has an empty pool. Use /multilogin to add one.`, 'info')
-        return
-      }
-      const switchable = accounts.filter(account =>
-        account.id !== PI_UPSTREAM_ACCOUNT_ID || upstreamConfigured)
-      if (switchable.length === 0) {
-        ctx.ui.notify(`No switchable accounts for ${providerName}. Use /multilogin to add one.`, 'info')
-        return
-      }
-
-      const affinityKey = sessionAffinityKey(integration, ctx, model, providerId)
-      const pin = service.getAffinity(poolId, affinityKey)
-      const currentId = pin !== undefined && (pool.affinity || pin.explicit)
-        ? pin.accountId
-        : undefined
-
+      const { poolId, providerName, pool, switchable, affinityKey, currentId } = target
       // Sibling extensions following the active account (usage widgets and the
       // like) re-resolve their account-scoped state from this notification.
       const announceSwitch = async (): Promise<void> => {
@@ -1843,32 +1945,47 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
 
       const ref = args.trim()
       let automatic = false
+      let earlyPick = false
       let chosen: PublicAccountSnapshot | undefined
       if (ref !== '') {
         const normalized = ref.toLowerCase()
-        let matches = switchable.filter(account => account.label.toLowerCase() === normalized)
-        if (matches.length === 0) {
-          matches = switchable.filter(account => account.label.toLowerCase().startsWith(normalized))
-        }
-        if (matches.length === 1) chosen = matches[0]
-        else if (matches.length === 0 && AUTOMATIC_SWITCH_REFS.has(normalized)) automatic = true
-        else if (matches.length > 1) {
-          ctx.ui.notify(`Multiple accounts match "${ref}". Pick one below.`, 'warning')
-        } else {
-          ctx.ui.notify(`No pooled account for ${providerName} matches "${ref}". Pick one below.`, 'warning')
+        if (normalized === PICK_STRATEGY_REF) earlyPick = true
+        else {
+          let matches = switchable.filter(account => account.label.toLowerCase() === normalized)
+          if (matches.length === 0) {
+            matches = switchable.filter(account => account.label.toLowerCase().startsWith(normalized))
+          }
+          if (matches.length === 1) chosen = matches[0]
+          else if (matches.length === 0 && AUTOMATIC_SWITCH_REFS.has(normalized)) automatic = true
+          else if (matches.length > 1) {
+            ctx.ui.notify(`Multiple accounts match "${ref}". Pick one below.`, 'warning')
+          } else {
+            ctx.ui.notify(`No pooled account for ${providerName} matches "${ref}". Pick one below.`, 'warning')
+          }
         }
       }
 
-      if (!automatic && chosen === undefined) {
-        const labels = [
-          `Automatic · let the ${pool.policy} strategy pick the next account`,
-          ...switchAccountLabels(switchable, currentId),
-        ]
-        const selected = await ctx.ui.select(`Switch ${providerName} account:`, labels)
-        const index = labels.indexOf(selected ?? '')
-        if (index < 0) return
-        if (index === 0) automatic = true
-        else chosen = switchable[index - 1]
+      if (!automatic && !earlyPick && chosen === undefined) {
+        // No UI means no menu to pick from, but an early pick still works: with
+        // no argument at all, run the pool's own strategy rather than telling a
+        // headless or RPC host that the command needs a terminal.
+        if (!ctx.hasUI) {
+          earlyPick = true
+        } else {
+          const pins = service.affinityEntries(poolId)
+          const labels = [
+            `Automatic · let the ${pool.policy} strategy pick the next account`,
+            `Pick now · run the ${pool.policy} strategy and keep the result`,
+            ...switchAccountLabels(switchable, currentId, accountId =>
+              sessionsOn(pins, accountId, affinityKey)),
+          ]
+          const selected = await ctx.ui.select(`Switch ${providerName} account:`, labels)
+          const index = labels.indexOf(selected ?? '')
+          if (index < 0) return
+          if (index === 0) automatic = true
+          else if (index === 1) earlyPick = true
+          else chosen = switchable[index - 2]
+        }
       }
 
       if (automatic) {
@@ -1879,6 +1996,37 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           pool.affinity
             ? "Cleared this session's pinned account. The next request re-selects using the pool strategy."
             : 'Selection for this session is already automatic.',
+          'info',
+        )
+        return
+      }
+
+      if (earlyPick) {
+        // Early pick: let the pool's configured strategy decide now instead of
+        // waiting for the next request to pin whatever it happens to choose.
+        // The probe lease is released as cancelled, so a request that never
+        // happened records no health against the account.
+        const picked = await service.acquire({ providerId: poolId })
+        const pickedAccountId = picked.accountId
+        const pickedLabel = picked.account.label
+        picked.release()
+        try {
+          await service.pinAccount(poolId, affinityKey, pickedAccountId)
+        } catch (error) {
+          ctx.ui.notify(`Could not pin the picked account: ${errorText(error)}`, 'error')
+          return
+        }
+        pi.appendEntry(SESSION_PIN_ENTRY_TYPE, {
+          pool: poolId,
+          key: affinityKey,
+          accountId: pickedAccountId,
+          label: pickedLabel,
+        })
+        await announceSwitch()
+        const attached = sessionsOn(service.affinityEntries(poolId), pickedAccountId, affinityKey)
+        ctx.ui.notify(
+          `multiprovider: the ${pool.policy} strategy picked ${pickedLabel} for this session`
+            + ` (${attached ?? 'first session here'}).`,
           'info',
         )
         return
@@ -1913,6 +2061,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         'info',
       )
     },
+    getArgumentCompletions: (argumentPrefix: string) => switchAccountCompletions(argumentPrefix),
   })
 
   pi.registerCommand('vprovider', {
@@ -1950,7 +2099,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
               .sort((left, right) => left.remaining - right.remaining)[0]!
             return formatUsageSummary(worst.snapshot)
           },
-          isBackendFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
+          flaggedLevels: (providerId, modelId) => flaggedLevelsFor(providerId, modelId),
           clearProviderBlock: providerId => {
             quotaBlocks.delete(providerId)
             void store.clearProviderBlock(providerId).catch(() => undefined)

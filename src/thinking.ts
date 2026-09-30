@@ -49,21 +49,60 @@ export function supportedThinkingLevels(source: ThinkingSource): Set<ModelThinki
   return supported
 }
 
+// Canonical rank order, used to measure how far a supported level sits from
+// the one a session asked for.
+const LEVEL_RANK = new Map<ModelThinkingLevel, number>(
+  ALL_LEVELS.map((level, index) => [level, index]),
+)
+
+// The level to actually send to a backend when the session asked for
+// `requested`: the nearest one that backend supports, measured on pi's
+// canonical order. Ties resolve downward so a pool never silently spends more
+// on reasoning than the operator asked for.
+//
+// Thinking level deliberately does not filter which backend serves a request:
+// the pool's strategy picks any backend and the level adapts to it. Returns
+// undefined when the source can serve no thinking level at all (a non-reasoning
+// model, or one whose map nulls every level) — the caller must then omit the
+// thinking parameter rather than send an effort the model would reject.
+export function nearestThinkingLevel(
+  source: ThinkingSource,
+  requested: ModelThinkingLevel,
+): ModelThinkingLevel | undefined {
+  const supported = supportedThinkingLevels(source)
+  if (supported.size === 0) return undefined
+  if (supported.has(requested)) return requested
+  const target = LEVEL_RANK.get(requested) ?? 0
+  let best: ModelThinkingLevel | undefined
+  let bestDistance = Number.POSITIVE_INFINITY
+  // ALL_LEVELS is ascending, so a strict comparison keeps the lowest level when
+  // two are equally close to what was asked.
+  for (const level of ALL_LEVELS) {
+    if (!supported.has(level)) continue
+    const distance = Math.abs((LEVEL_RANK.get(level) ?? 0) - target)
+    if (distance < bestDistance) {
+      best = level
+      bestDistance = distance
+    }
+  }
+  return best
+}
+
 // Unions the thinking support of all reasoning-capable sources: a level is
 // advertised when at least one backend can serve it. Sources with reasoning
 // disabled never reject a thinking parameter (their provider omits it), so
 // they neither contribute to nor restrict the map.
 //
-// Union (not intersection) because virtualStream guards every attempt: a
-// backend whose live model cannot serve the requested level is skipped
-// pre-flight without spending an HTTP call. Intersecting instead would let a
-// single weak backend cap the whole pool — a mixed glm (low/high/max) +
-// Qwen (low/medium/xhigh) pool would advertise only 'low' and the operator
-// could never select 'high' at all.
+// Union (not intersection) because selection must stay across the whole pool:
+// intersecting would let a single weak backend cap everything — a mixed glm
+// (low/high/max) + Qwen (low/medium/xhigh) pool would advertise only 'low' and
+// the operator could never select 'high' at all. Instead virtualStream sends
+// every backend the strategy picks and degrades that request's level to the
+// nearest one the backend serves (see nearestThinkingLevel).
 //
-// The result is an identity map, so pi clamps the session's default level
-// against exactly what the pool can serve; selecting a level only some
-// backends support narrows which backends serve that session.
+// The result is an identity map, so pi offers exactly the levels some backend
+// can serve; a request at a level the picked backend lacks is served at the
+// closest one instead of failing over.
 export function resolveVirtualThinkingMap(
   sources: readonly ThinkingSource[],
 ): ThinkingLevelMap | undefined {

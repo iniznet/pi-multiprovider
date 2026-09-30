@@ -40,6 +40,7 @@ export {
   type UsageWindow,
 } from './usage-probe.ts'
 export {
+  nearestThinkingLevel,
   resolveVirtualThinkingMap,
   supportedThinkingLevels,
   VIRTUAL_DEFAULT_LEVEL_ORDER,
@@ -52,6 +53,13 @@ export {
   type AnnouncementDependencies,
   type ServiceAnnouncementHandle,
 } from './announcement.ts'
+export {
+  pickSuggestions,
+  sessionsOn,
+  type PickCandidate,
+  type PickSuggestion,
+  type PickSuggestionInput,
+} from './pick.ts'
 export { registerMultiProvider } from './register.ts'
 export {
   applySessionPins,

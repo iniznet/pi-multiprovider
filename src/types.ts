@@ -86,6 +86,12 @@ export interface AffinityPin {
   explicit: boolean
 }
 
+// One recorded session-to-account attachment, for surfaces that show who is
+// already served by an account before an operator picks another one.
+export interface AffinityEntry extends AffinityPin {
+  key: string
+}
+
 export interface AcquireOptions {
   providerId: string
   affinityKey?: string

@@ -23,6 +23,7 @@ import { affinityScope } from './affinity-scope.ts'
 import type { MultiProviderService } from './service.ts'
 import { isFatalMetadataFailure, isQuotaFailure } from './quota.ts'
 import {
+  nearestThinkingLevel,
   resolveVirtualThinkingMap,
   supportedThinkingLevels,
   type ModelThinkingLevel,
@@ -108,8 +109,15 @@ export interface VirtualProviderDependencies {
   onBackendQuotaFailure?: (providerId: string, failure: ProviderAttemptFailure) => void
   // Per-(provider, model) incompatibility flags for permanent metadata
   // rejections; flagged pairs are skipped for the rest of the process.
-  isModelFlagged?: (providerId: string, modelId: string) => boolean
-  onBackendFatalMetadata?: (providerId: string, modelId: string, failure: ProviderAttemptFailure) => void
+  // A pair is flagged only for the level that was actually rejected (undefined
+  // = it rejected reasoning control with no level in play, so no level works).
+  isModelFlagged?: (providerId: string, modelId: string, level: ModelThinkingLevel | undefined) => boolean
+  onBackendFatalMetadata?: (
+    providerId: string,
+    modelId: string,
+    level: ModelThinkingLevel | undefined,
+    failure: ProviderAttemptFailure,
+  ) => void
   // Names the backend a request was dispatched to, so a host can show which
   // provider is actually serving the session. Fires at dispatch time: a
   // failover re-reports with the backend that takes over.
@@ -123,6 +131,10 @@ export interface VirtualServedInfo {
   virtualModelId: string
   providerId: string
   modelId: string
+  /** Thinking level the session asked for, when it asked for one. */
+  requestedLevel?: ModelThinkingLevel
+  /** The level actually sent: equal unless the backend could not serve it. */
+  servedLevel?: ModelThinkingLevel
 }
 
 export interface VirtualIntegrationOptions {
@@ -196,13 +208,6 @@ function skipFailureFor(
   dependencies: VirtualProviderDependencies,
   backend: VirtualBackend,
 ): ProviderAttemptFailure | undefined {
-  if (dependencies.isModelFlagged?.(backend.providerId, backend.modelId) === true) {
-    return {
-      message: BACKEND_INCOMPATIBLE_PREFIX + ': "' + backend.providerId + '/' + backend.modelId
-        + '" was flagged incompatible earlier in this session',
-      outputStarted: false,
-    }
-  }
   if (dependencies.isProviderBlocked?.(backend.providerId) === true) {
     return {
       message: BACKEND_QUOTA_BLOCKED_PREFIX + ': provider "' + backend.providerId
@@ -211,6 +216,23 @@ function skipFailureFor(
     }
   }
   return undefined
+}
+
+// Skip a pair this session already saw reject the exact level about to be
+// sent. Selection is never filtered by advertised thinking support — only by a
+// proven rejection at that level, which is the one thing a retry cannot fix.
+function flagFailureFor(
+  dependencies: VirtualProviderDependencies,
+  backend: VirtualBackend,
+  level: ModelThinkingLevel | undefined,
+): ProviderAttemptFailure | undefined {
+  if (dependencies.isModelFlagged?.(backend.providerId, backend.modelId, level) !== true) return undefined
+  return {
+    message: BACKEND_INCOMPATIBLE_PREFIX + ': "' + backend.providerId + '/' + backend.modelId
+      + (level === undefined ? '" was rejected' : '" at level "' + level + '" was rejected')
+      + ' earlier in this session',
+    outputStarted: false,
+  }
 }
 
 function virtualStream<TApi extends Api>(
@@ -276,6 +298,9 @@ function virtualStream<TApi extends Api>(
         let outputStarted = false
         let start: BufferedTerminal['start']
         let response: ProviderResponse | undefined
+        // The thinking level this attempt actually sends, once the backend's own
+        // support is resolved. A rejection is attributed to exactly this level.
+        let sentLevel: ModelThinkingLevel | undefined
         // Per-lease outcome once the backend is abandoned: 'next-account'
         // rotates to the next backend inline; 'surface' ends the stream with
         // the buffered error so an external failover handler (e.g.
@@ -299,7 +324,7 @@ function virtualStream<TApi extends Api>(
           if (disposition?.kind === 'quota' || isQuotaFailure(failure)) {
             dependencies.onBackendQuotaFailure?.(backend.providerId, failure)
           } else if (disposition?.kind === 'fatal' && isFatalMetadataFailure(failure)) {
-            dependencies.onBackendFatalMetadata?.(backend.providerId, backend.modelId, failure)
+            dependencies.onBackendFatalMetadata?.(backend.providerId, backend.modelId, sentLevel, failure)
           }
           return disposition
         }
@@ -314,25 +339,26 @@ function virtualStream<TApi extends Api>(
             throw lastSetupError
           }
 
-          // The request's thinking level must be one the backing model can
-          // actually serve. The virtual map advertises the union of what the
-          // pool supports, so a level mismatch here is expected and
-          // request-scoped: skip this backend for this request only. It must
-          // NOT permanently flag the pair, or selecting 'high' once would
-          // evict the medium-only backends from the pool for good.
+          // Thinking level never filters which backend serves a request: the
+          // pool's strategy picks any backend and this request's level degrades
+          // to the nearest one that backend actually supports. 'off' and
+          // non-reasoning models are passed through exactly as the host asked —
+          // inventing a thinking level is not ours to do.
           const requestedLevel = typeof requestOptions.reasoningEffort === 'string'
             && requestOptions.reasoningEffort !== 'off'
             ? requestOptions.reasoningEffort as ModelThinkingLevel
             : undefined
-          if (requestedLevel !== undefined && target.model.reasoning
-            && !supportedThinkingLevels(target.model).has(requestedLevel)) {
-            const failure: ProviderAttemptFailure = {
-              message: BACKEND_INCOMPATIBLE_PREFIX + ': "' + backend.providerId + '/' + backend.modelId
-                + '" does not support thinking level "' + requestedLevel + '"',
-              outputStarted: false,
-            }
-            lastSetupError = new Error(failure.message)
-            const disposition = releaseFailure(failure)
+          const servedLevel = requestedLevel === undefined || !target.model.reasoning
+            ? requestedLevel
+            : nearestThinkingLevel(target.model, requestedLevel)
+          sentLevel = servedLevel
+
+          // The one case that still removes a backend: this pair already
+          // rejected this exact level earlier in the session.
+          const flagged = flagFailureFor(dependencies, backend, servedLevel)
+          if (flagged !== undefined) {
+            lastSetupError = new Error(flagged.message)
+            const disposition = lease.release({ status: 'failure', error: flagged })
             settled = true
             if (disposition?.retryable && attempts < maxAttempts && !signal.aborted) continue
             throw lastSetupError
@@ -340,6 +366,9 @@ function virtualStream<TApi extends Api>(
 
           const ambient = await dependencies.resolveAmbientAuth(backend.providerId, target.model, signal)
           const attemptOptions = { ...requestOptions } as RequestOptions
+          if (servedLevel !== undefined && servedLevel !== requestedLevel) {
+            attemptOptions.reasoningEffort = servedLevel
+          }
           // The host resolves auth for the virtual provider itself (a
           // placeholder key); backing auth comes from the ambient layer below
           // or from the backing provider's own integration.
@@ -393,6 +422,8 @@ function virtualStream<TApi extends Api>(
             virtualModelId: model.id,
             providerId: backend.providerId,
             modelId: backend.modelId,
+            ...(requestedLevel === undefined ? {} : { requestedLevel }),
+            ...(servedLevel === undefined ? {} : { servedLevel }),
           })
 
           // Same-account tolerance: pre-output retryable errors are absorbed

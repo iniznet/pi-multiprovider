@@ -5,6 +5,7 @@ import type {
   AccountLease,
   AccountPreference,
   AcquireOptions,
+  AffinityEntry,
   AffinityPin,
   FailureDisposition,
   FailureKind,
@@ -348,6 +349,23 @@ export class MultiProviderService {
       this.explicitAffinity.set(providerId, explicit)
     }
     explicit.add(affinityKey)
+  }
+
+  // Every session currently attached to a pool. Implicit picks and explicit
+  // pins are both listed so a fan-out's spread — or its concentration on one
+  // credential — is visible instead of guessed at. Unknown pools return an empty
+  // list rather than throwing: the argument-completion path calls this
+  // speculatively while the user is still typing.
+  affinityEntries(providerId: string): AffinityEntry[] {
+    if (!this.providers.has(providerId)) return []
+    const table = this.affinity.get(providerId)
+    if (table === undefined) return []
+    const explicit = this.explicitAffinity.get(providerId)
+    return [...table.entries()].map(([key, accountId]) => ({
+      key,
+      accountId,
+      explicit: explicit?.has(key) === true,
+    }))
   }
 
   getAffinity(providerId: string, affinityKey: string): AffinityPin | undefined {
