@@ -128,7 +128,7 @@ type EditorPage =
   | { kind: 'provider-picker' }
   | { kind: 'model-picker' }
   | { kind: 'backend' }
-  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' }
+  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'reset-hour' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -156,6 +156,8 @@ class VirtualProviderEditorDialog extends Container {
   private createProviderId: string | undefined
   private chosenProvider: Provider<Api> | undefined
   private activeBackendIndex = 0
+  // Provider whose billing reset hour the input page is currently editing.
+  private activeResetHourProvider: string | undefined
   private inputInitial = ''
   private pageError = ''
   private activeList: SettingsList | undefined
@@ -301,10 +303,14 @@ class VirtualProviderEditorDialog extends Container {
   ]
 
   private billingLabel(providerId: string): string {
-    const staged = this.billingDraft.has(providerId)
+    const staged = this.activeBillingPolicy(providerId)
+    return staged === undefined ? 'off' : describeBillingPolicy(staged)
+  }
+
+  private activeBillingPolicy(providerId: string): BillingPolicy | undefined {
+    return this.billingDraft.has(providerId)
       ? this.billingDraft.get(providerId)
       : this.providerBilling(providerId)
-    return staged === undefined ? 'off' : describeBillingPolicy(staged)
   }
 
   private buildMenu(): void {
@@ -324,6 +330,17 @@ class VirtualProviderEditorDialog extends Container {
         'billing-' + providerId,
         `Billing (${providerId}): ${this.billingLabel(providerId)}`,
       )),
+      // Calendar billing kinds get a configurable local reset hour; the
+      // rolling 'hours' window has none (it always resets a full window later).
+      ...billingProviders
+        .filter(providerId => {
+          const policy = this.activeBillingPolicy(providerId)
+          return policy !== undefined && policy.kind !== 'hours'
+        })
+        .map(providerId => this.menuItem(
+          'reset-hour-' + providerId,
+          `Reset hour (${providerId}): ${String(this.activeBillingPolicy(providerId)!.hour ?? 0).padStart(2, '0')}:00`,
+        )),
       ...blockedProviders.map(providerId => this.menuItem(
         'clear-quota-' + providerId,
         `Clear quota block (${providerId} · until ${new Date(this.providerBlockUntil(providerId)!).toLocaleTimeString()})`,
@@ -372,6 +389,12 @@ class VirtualProviderEditorDialog extends Container {
           )
           this.billingDraft.set(providerId, cycle[(index + 1) % cycle.length]!)
           this.goTo({ kind: 'menu' })
+        } else if (id.startsWith('reset-hour-')) {
+          const providerId = id.slice('reset-hour-'.length)
+          this.activeResetHourProvider = providerId
+          this.inputBackPage = { kind: 'menu' }
+          this.inputInitial = String(this.activeBillingPolicy(providerId)?.hour ?? 0)
+          this.goTo({ kind: 'input', purpose: 'reset-hour' })
         } else if (id.startsWith('clear-quota-')) {
           this.clearProviderBlock(id.slice('clear-quota-'.length))
           this.goTo({ kind: 'menu' })
@@ -509,12 +532,16 @@ class VirtualProviderEditorDialog extends Container {
       ? 'Virtual provider id'
       : purpose === 'model-id'
       ? 'Virtual model id (shown in /model)'
+      : purpose === 'reset-hour'
+      ? 'Set reset hour (0-23, local time)'
       : purpose === 'priority' ? 'Set priority (lower runs first)' : 'Set weight'
     this.addHeading(title, 'Enter confirms · Esc goes back.')
     const input = new Input()
     input.setValue(this.inputInitial)
     input.onSubmit = () => purpose === 'priority'
       ? this.applyPriorityInput(input.getValue())
+      : purpose === 'reset-hour'
+      ? this.applyResetHourInput(input.getValue())
       : this.applyInput(purpose, input.getValue())
     input.onEscape = () => this.goTo(this.inputBackPage)
     this.activeInput = input
@@ -569,6 +596,24 @@ class VirtualProviderEditorDialog extends Container {
       return
     }
     backend.weight = parsed
+    this.goTo({ kind: 'menu' })
+  }
+
+  private applyResetHourInput(raw: string): void {
+    const providerId = this.activeResetHourProvider
+    const parsed = Number(raw.trim())
+    if (providerId === undefined || !Number.isInteger(parsed) || parsed < 0 || parsed > 23) {
+      this.pageError = 'Reset hour must be an integer 0-23 (local time).'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    const policy = this.activeBillingPolicy(providerId)
+    if (policy === undefined || policy.kind === 'hours') {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    this.billingDraft.set(providerId, { ...policy, hour: parsed })
     this.goTo({ kind: 'menu' })
   }
 

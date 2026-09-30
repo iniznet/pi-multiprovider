@@ -229,6 +229,8 @@ export interface BillingPolicy {
   kind: BillingResetKind
   /** Rolling window length in hours; required (1-336) when kind is 'hours'. */
   hours?: number
+  /** Local reset hour (0-23) for calendar kinds; default 0 (midnight). */
+  hour?: number
 }
 
 // Persisted quota bookkeeping for one backing provider: the operator-declared

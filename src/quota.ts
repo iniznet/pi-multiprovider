@@ -33,19 +33,38 @@ export function computeResetAt(policy: BillingPolicy, now: number): number {
     const hours = policy.hours ?? 1
     return now + Math.min(336, Math.max(1, hours)) * HOUR_MS
   }
+  // Calendar resets honor the operator's local reset hour (0-23, default
+  // midnight): the next boundary is today when the reset hour has not passed
+  // yet. With the default hour 0 that is always tomorrow, matching the
+  // previous fixed-midnight behavior.
+  const hour = policy.hour ?? 0
   const now_ = new Date(now)
   if (policy.kind === 'daily') {
-    return new Date(now_.getFullYear(), now_.getMonth(), now_.getDate() + 1).getTime()
+    const todayAtHour = new Date(now_.getFullYear(), now_.getMonth(), now_.getDate(), hour).getTime()
+    return todayAtHour > now
+      ? todayAtHour
+      : new Date(now_.getFullYear(), now_.getMonth(), now_.getDate() + 1, hour).getTime()
   }
   if (policy.kind === 'weekly') {
-    const daysUntilMonday = ((8 - now_.getDay()) % 7) || 7
-    return new Date(now_.getFullYear(), now_.getMonth(), now_.getDate() + daysUntilMonday).getTime()
+    const daysAhead = (8 - now_.getDay()) % 7
+    const candidate = new Date(
+      now_.getFullYear(), now_.getMonth(), now_.getDate() + daysAhead, hour,
+    ).getTime()
+    return candidate > now
+      ? candidate
+      : new Date(now_.getFullYear(), now_.getMonth(), now_.getDate() + daysAhead + 7, hour).getTime()
   }
-  return new Date(now_.getFullYear(), now_.getMonth() + 1, 1).getTime()
+  const firstAtHour = new Date(now_.getFullYear(), now_.getMonth(), 1, hour).getTime()
+  return firstAtHour > now
+    ? firstAtHour
+    : new Date(now_.getFullYear(), now_.getMonth() + 1, 1, hour).getTime()
 }
 
 export function describeBillingPolicy(policy: BillingPolicy): string {
   if (policy.kind === 'hours') return policy.hours + 'h window'
+  if (policy.hour !== undefined) {
+    return policy.kind + ' @ ' + String(policy.hour).padStart(2, '0') + ':00'
+  }
   return policy.kind
 }
 
@@ -65,7 +84,16 @@ export function normalizeBillingPolicy(value: unknown): BillingPolicy | undefine
     }
     return { kind: candidate.kind, hours: Math.floor(hours) }
   }
-  return { kind: candidate.kind }
+  if (candidate.hour !== undefined
+    && (typeof candidate.hour !== 'number'
+      || !Number.isInteger(candidate.hour)
+      || candidate.hour < 0
+      || candidate.hour > 23)) {
+    throw new Error('multiprovider: billing policy hour must be an integer between 0 and 23')
+  }
+  return candidate.hour === undefined
+    ? { kind: candidate.kind }
+    : { kind: candidate.kind, hour: candidate.hour }
 }
 
 export function normalizeProviderQuotaEntry(value: unknown): { billing?: BillingPolicy; blockedUntil?: number; reason?: string } {
