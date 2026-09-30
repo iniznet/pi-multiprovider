@@ -138,12 +138,15 @@ Scheduler affinity lives in memory, per process — so a picker in one terminal 
 - **Liveness**: pi has no cross-process "is that tab still open" signal, so freshness is the proxy — a row nobody refreshed for 30 minutes is treated as closed and dropped on the next write. A session that wakes up re-registers on its next request.
 - **Growth**: bounded per pool (newest 64 sessions), so a busy machine cannot grow the file without limit.
 - **Authority**: the local table always wins for its own session. A mirrored row can predate a switch this process just made, so merging never lets stale disk data override live state.
+- **Where it shows**: the `/switch-account` argument list and menu, and every backend row in `/vprovider`. A store read failure degrades those to this-process rows rather than blanking them.
 
 ## Virtual providers## Virtual providers
 
 A virtual provider maps **one model to multiple provider models**. Sessions are spread across the backing providers with unbiased round robin—no first-provider favoritism—while session affinity pins each session to one backend, so prompt caches stay warm between requests and every subscription sees roughly its share of sessions.
 
 `/vprovider` exposes **Session affinity** per pool. Leave it on for interactive use; set it to `off (rotate)` when a fan-out host's nested agents share one session identity and you would rather spread them across backends than concentrate a burst on one credential. Explicit `/switch-account` pins take precedence either way.
+
+Each backend row also names who is on it — `this session`, `2 others`, or `no sessions` — counted across every open pi process, so you can see a pool collapsing onto one credential before you send anything.
 
 Create one with `/vprovider`:
 

@@ -49,6 +49,7 @@ import {
   type ModelThinkingLevel,
   type PublicPoolSnapshot,
   type AffinityEntry,
+  type SessionAttachmentEntry,
   type VirtualServedInfo,
   mergeAttachments,
   virtualBackendAccountId,
@@ -164,6 +165,8 @@ class VirtualProviderEditorDialog extends Container {
   private readonly providerBlockUntil: (providerId: string) => number | undefined
   private readonly accountUsage: (providerId: string) => string | undefined
   private readonly flaggedLevels: (providerId: string, modelId: string) => string[]
+  private readonly poolAttachments: (poolId: string) => AffinityEntry[]
+  private readonly currentSessionKey: () => string
   private readonly clearProviderBlock: (providerId: string) => void
   private readonly pageContainer = new Container()
   private readonly listTheme: SettingsListTheme
@@ -190,6 +193,8 @@ class VirtualProviderEditorDialog extends Container {
     providerBlockUntil?: (providerId: string) => number | undefined
     accountUsage?: (providerId: string) => string | undefined
     flaggedLevels?: (providerId: string, modelId: string) => string[]
+    poolAttachments?: (poolId: string) => AffinityEntry[]
+    currentSessionKey?: () => string
     clearProviderBlock?: (providerId: string) => void
     done: (outcome: VirtualEditorOutcome) => void
   }) {
@@ -202,6 +207,8 @@ class VirtualProviderEditorDialog extends Container {
     this.providerBlockUntil = options.providerBlockUntil ?? (() => undefined)
     this.accountUsage = options.accountUsage ?? (() => undefined)
     this.flaggedLevels = options.flaggedLevels ?? (() => [])
+    this.poolAttachments = options.poolAttachments ?? (() => [])
+    this.currentSessionKey = options.currentSessionKey ?? (() => '')
     this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
     this.done = options.done
     this.draft = options.startDraft
@@ -372,6 +379,12 @@ class VirtualProviderEditorDialog extends Container {
         const flags = this.flaggedLevels(backend.providerId, backend.modelId)
         const flagged = flags.length > 0
         const usage = this.accountUsage(backend.providerId)
+        // Which sessions are on this backend, across every open pi process.
+        const attached = sessionsOn(
+          this.poolAttachments(virtualSchedulerId(this.draft!.id, model.id)),
+          virtualBackendAccountId(backend),
+          this.currentSessionKey(),
+        )
         return this.menuItem(
           `backend-${index}`,
           `${index + 1}. ${backend.providerId}`
@@ -379,6 +392,7 @@ class VirtualProviderEditorDialog extends Container {
               + (backend.priority === undefined ? '' : ` · p${backend.priority}`)
               + (blocked ? ' · quota-blocked' : '')
               + (flagged ? ' · flagged(' + flags.join(',') + ')' : '')
+              + (attached === undefined ? ' · no sessions' : ` · ${attached}`)
               + (usage === undefined ? '' : ` · ${usage}`)),
         )
       }),
@@ -1052,6 +1066,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         explicit,
       })
       attachmentWrites.set(trackKey, { accountId, at: Date.now() })
+      // The write just changed what a refresh would read.
+      attachmentCache.delete(poolId)
     } catch {
       // The local scheduler stays authoritative for this process; a failed
       // mirror only costs other processes a row they will not see yet.
@@ -1077,14 +1093,34 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     void recordAttachment(poolId, key, accountId, label, service.getAffinity(poolId, key)?.explicit === true)
   }
 
+  // Latest attachment view per pool, kept warm for synchronous surfaces: the
+  // virtual-pool editor builds its menu without an await point. Local pins are
+  // always included, so a cold cache degrades to this-process truth rather than
+  // to nothing.
+  const attachmentCache = new Map<string, AffinityEntry[]>()
+
+  const refreshAttachmentCache = async (poolIds: readonly string[]): Promise<void> => {
+    if (poolIds.length === 0) return
+    const local = new Map(poolIds.map(poolId =>
+      [poolId, service.affinityEntries(poolId)] as const))
+    let mirrored: SessionAttachmentEntry[] = []
+    try {
+      mirrored = await store.listSessionAttachments()
+    } catch {
+      // One read failure must not blank the list; fall back to local rows.
+    }
+    for (const poolId of poolIds) {
+      attachmentCache.set(poolId, mergeAttachments(local.get(poolId) ?? [], mirrored, poolId))
+    }
+  }
+
+  const cachedAttachments = (poolId: string): AffinityEntry[] =>
+    attachmentCache.get(poolId) ?? service.affinityEntries(poolId)
+
   // Local pins plus every other process's mirrored rows, newest first.
   const attachmentView = async (poolId: string): Promise<AffinityEntry[]> => {
-    const local = service.affinityEntries(poolId)
-    try {
-      return mergeAttachments(local, await store.listSessionAttachments(), poolId)
-    } catch {
-      return local
-    }
+    await refreshAttachmentCache([poolId])
+    return cachedAttachments(poolId)
   }
 
   const servedBackends = new Map<string, ServedBackend>()
@@ -2070,7 +2106,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         service.clearAffinity(poolId, affinityKey)
         // Withdraw the mirrored row too, or other processes keep showing a
         // session that has just gone automatic.
-        void store.clearSessionAttachment(poolId, affinityKey).catch(() => undefined)
+        void store.clearSessionAttachment(poolId, affinityKey)
+          .then(() => attachmentCache.delete(poolId))
+          .catch(() => undefined)
         attachmentWrites.delete(poolId + VIRTUAL_ID_SEPARATOR + affinityKey)
         pi.appendEntry(SESSION_PIN_ENTRY_TYPE, { pool: poolId, key: affinityKey })
         await announceSwitch()
@@ -2160,6 +2198,10 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       const stored = await store.listVirtualProviders()
       const candidates = uniqueProviders(ctx, baseProviders)
         .filter(provider => !virtualProviders.has(provider.id) && provider.getModels().length > 0)
+      // One shared-store read warms every pool the editor can show, so its rows
+      // report sessions from other processes rather than only this one.
+      await refreshAttachmentCache(stored.flatMap(config =>
+        config.models.map(model => virtualSchedulerId(config.id, model.id))))
       const ref = args.trim().toLowerCase()
       const existing = ref === '' ? undefined : stored.find(candidate => candidate.id.toLowerCase() === ref)
       const outcome = await ctx.ui.custom<VirtualEditorOutcome>(
@@ -2185,6 +2227,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
             return formatUsageSummary(worst.snapshot)
           },
           flaggedLevels: (providerId, modelId) => flaggedLevelsFor(providerId, modelId),
+          poolAttachments: cachedAttachments,
+          currentSessionKey: () => currentContext?.sessionManager.getSessionId() ?? '',
           clearProviderBlock: providerId => {
             quotaBlocks.delete(providerId)
             void store.clearProviderBlock(providerId).catch(() => undefined)

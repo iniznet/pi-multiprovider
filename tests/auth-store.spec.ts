@@ -9,7 +9,9 @@ import {
 } from '@earendil-works/pi-ai'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  mergeAttachments,
   MultiAuthStore,
+  sessionsOn,
   SESSION_ATTACHMENTS_PER_POOL_LIMIT,
   SESSION_ATTACHMENT_TTL_MS,
   type SelectionPolicy,
@@ -403,6 +405,33 @@ describe('MultiAuthStore virtual providers', () => {
     const stored = JSON.parse(await readFile(path, 'utf8'))
     expect(Object.keys(stored.sessions['pooled::ultra']['session-5']).sort())
       .toEqual(['accountId', 'explicit', 'label', 'updatedAt'])
+  })
+
+  it('exposes one process\'s attachments to another through the shared file', async () => {
+    // Two store instances over one path stand in for two terminal tabs: neither
+    // shares memory with the other, so the file is the only cross-process view.
+    const { directory, store: tabA } = await storeFixture()
+    const tabB = new MultiAuthStore(join(directory, 'multiprovider-auth.json'))
+    await tabA.recordSessionAttachment('pooled::ultra', 'session-a',
+      { accountId: 'hypercharm::glm-5.3-flash', label: 'HyperCharm · glm-5.3-flash', explicit: false }, 1_000)
+    expect((await tabB.listSessionAttachments(Number.MAX_SAFE_INTEGER, 2_000))[0])
+      .toMatchObject({
+        poolId: 'pooled::ultra',
+        key: 'session-a',
+        accountId: 'hypercharm::glm-5.3-flash',
+        explicit: false,
+      })
+    // tabB has no local pin for that session, so the merge is what surfaces it.
+    const merged = mergeAttachments([], await tabB.listSessionAttachments(Number.MAX_SAFE_INTEGER, 2_000), 'pooled::ultra')
+    expect(merged).toEqual([{
+      key: 'session-a',
+      accountId: 'hypercharm::glm-5.3-flash',
+      explicit: false,
+      remote: true,
+    }])
+    expect(sessionsOn(merged, 'hypercharm::glm-5.3-flash', 'session-b')).toBe('1 other')
+    // Past the TTL the peer's row is simply gone, not shown as an active session.
+    expect(await tabB.listSessionAttachments(500, 2_000)).toEqual([])
   })
 
   it('bounds stored sessions per pool and rejects malformed attachments', async () => {
