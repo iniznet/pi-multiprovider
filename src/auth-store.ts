@@ -302,10 +302,15 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
     }
   })
   const strategy = normalizeStrategy(candidate.strategy, candidate.id)
+  if (candidate.affinity !== undefined && typeof candidate.affinity !== 'boolean') {
+    throw new Error(`multiprovider: malformed affinity for virtual provider "${candidate.id}"`)
+  }
   return {
     id: candidate.id,
     label: candidate.label.trim(),
     ...(strategy === undefined || strategy === 'round-robin' ? {} : { strategy }),
+    // Affinity on is the default, so only an explicit opt-out is persisted.
+    ...(candidate.affinity ? {} : candidate.affinity === false ? { affinity: false } : {}),
     models,
   }
 }

@@ -109,6 +109,9 @@ function setup(
   options: {
     service?: MultiProviderService
     onFailover?: (info: FailoverInfo) => boolean | void
+    affinityKey?: () => string | undefined
+    hostAffinityKey?: () => string | undefined
+    selectionBias?: 'first-account' | 'none'
   } = {},
 ) {
   // Default scheduler tolerance absorbs three errors per account; the
@@ -120,6 +123,7 @@ function setup(
     id: model.provider,
     label: 'Same Provider',
     accounts: () => accounts,
+    ...(options.selectionBias === undefined ? {} : { selectionBias: options.selectionBias }),
   })
   const lifted = liftProvider<'test-api', string>(baseProvider(handler), service, {
     resolveAuth: account => ({
@@ -132,6 +136,8 @@ function setup(
       source: account.label,
     }),
     ...(options.onFailover === undefined ? {} : { onFailover: options.onFailover }),
+    ...(options.affinityKey === undefined ? {} : { affinityKey: options.affinityKey }),
+    ...(options.hostAffinityKey === undefined ? {} : { hostAffinityKey: options.hostAffinityKey }),
   })
   const models = createModels()
   models.setProvider(lifted)
@@ -141,6 +147,54 @@ function setup(
 }
 
 describe('liftProvider', () => {
+  it('pins per requesting session so nested agents do not share one account', async () => {
+    const keys: Array<string | undefined> = []
+    const handler: Handler = (_requestModel, _context, options) => {
+      keys.push(options?.apiKey)
+      const stream = createAssistantMessageEventStream()
+      finishWithText(stream, 'ok')
+      return stream
+    }
+    // Unbiased rotation, matching how virtual pools register: with the default
+    // 'first-account' bias every new key would prefer the main account anyway.
+    // The service is seeded because an unbiased rotation opens at a random
+    // offset, which would make the expected order non-deterministic.
+    const { models, selected } = setup(handler, {
+      hostAffinityKey: () => 'host-1',
+      selectionBias: 'none',
+      service: new MultiProviderService({ randomInt: () => 0, rateLimitCooldownMs: 60_000, errorsBeforeSwitch: 1 }),
+    })
+    await models.streamSimple(selected, { messages: [] }, { sessionId: 'agent-1' }).result()
+    await models.streamSimple(selected, { messages: [] }, { sessionId: 'agent-1' }).result()
+    await models.streamSimple(selected, { messages: [] }, { sessionId: 'agent-2' }).result()
+    // agent-1 keeps its account, agent-2 gets its own rather than inheriting the
+    // host pin, and an undeclared caller falls back to the host session.
+    await models.streamSimple(selected, { messages: [] }).result()
+    expect(keys).toEqual(['account-a', 'account-a', 'account-b', 'account-a'])
+  })
+
+  it('lets a provider-owned affinity key outrank a caller-declared session', async () => {
+    // An integration's own routing key is a deliberate decision (per-tenant
+    // stickiness, for example); a nested agent declaring its session must not
+    // fragment it across accounts.
+    const keys: Array<string | undefined> = []
+    const handler: Handler = (_requestModel, _context, options) => {
+      keys.push(options?.apiKey)
+      const stream = createAssistantMessageEventStream()
+      finishWithText(stream, 'ok')
+      return stream
+    }
+    const { models, selected } = setup(handler, {
+      affinityKey: () => 'tenant-42',
+      hostAffinityKey: () => 'host-1',
+      selectionBias: 'none',
+      service: new MultiProviderService({ randomInt: () => 0, rateLimitCooldownMs: 60_000, errorsBeforeSwitch: 1 }),
+    })
+    await models.streamSimple(selected, { messages: [] }, { sessionId: 'agent-1' }).result()
+    await models.streamSimple(selected, { messages: [] }, { sessionId: 'agent-2' }).result()
+    expect(keys).toEqual(['account-a', 'account-a'])
+  })
+
   it('rotates auth before output without changing provider or model identity', async () => {
     const attempts: Array<{
       provider: string

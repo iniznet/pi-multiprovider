@@ -217,6 +217,10 @@ export interface VirtualProviderConfig {
   id: string
   label: string
   strategy?: SelectionPolicy
+  // Session stickiness across this pool's backends. Default true, matching
+  // account pools. Turn it off when a fan-out host (subagents, workflows)
+  // should spread across backends instead of reusing one per session.
+  affinity?: boolean
   models: VirtualModelConfig[]
 }
 
@@ -302,6 +306,11 @@ export interface LiftProviderOptions<TApi extends Api = Api, TCredentialRef = un
     model: Model<TApi>
     context: TranscriptContext
   }) => string | undefined
+  // Host session identity used only when no provider-owned affinityKey exists.
+  // Kept separate so a caller-declared session (pi core sets `sessionId` on
+  // stream options) can scope stickiness per nested agent without overriding an
+  // integration's deliberate routing key.
+  hostAffinityKey?: () => string | undefined
   disableProviderRetries?: boolean
   maxAccountAttempts?: number
   onFailover?: (info: FailoverInfo) => boolean | void

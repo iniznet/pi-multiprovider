@@ -19,6 +19,7 @@ import {
   type BufferedTerminal,
 } from './lift.ts'
 import { sessionAttributionHeaders } from './session-attribution.ts'
+import { affinityScope } from './affinity-scope.ts'
 import type { MultiProviderService } from './service.ts'
 import { isFatalMetadataFailure, isQuotaFailure } from './quota.ts'
 import {
@@ -224,7 +225,13 @@ function virtualStream<TApi extends Api>(
     const requestOptions = { ...(options ?? {}) } as RequestOptions
     const signal = requestOptions.signal ?? new AbortController().signal
     const schedulerId = virtualSchedulerId(config.id, model.id)
-    const affinityKey = dependencies.getAffinityKey()
+    // Stickiness itself stays the scheduler's call (pool.affinity decides
+    // whether an implicit pin applies, while an explicit /switch-account pin
+    // always does); this only decides *whose* identity is used as the key.
+    const affinityKey = affinityScope(
+      requestOptions,
+      dependencies.getAffinityKey(),
+    )
     const attempted = new Set<string>()
     const maxAttempts = dependencies.maxAccountAttempts ?? Number.MAX_SAFE_INTEGER
     const errorsBeforeSwitch = service.getErrorsBeforeSwitch()
@@ -251,7 +258,7 @@ function virtualStream<TApi extends Api>(
         try {
           lease = await service.acquire<VirtualBackend>({
             providerId: schedulerId,
-            affinityKey,
+            ...(affinityKey === undefined ? {} : { affinityKey }),
             excludeAccountIds: attempted,
           })
         } catch (error) {
@@ -364,15 +371,15 @@ function virtualStream<TApi extends Api>(
           // virtual stream would miss them (opencode.ai rejects such requests
           // with 400 MissingSessionID). Re-apply them for the model actually
           // dispatched, filling only what the core pipeline and provider hooks
-          // left unset. For virtual integrations the affinity key is the pi
-          // session id.
+          // left unset. The identity is the requesting session: the nested
+          // agent's own when it declares one, else the host session.
           type HeaderTransform = (headers: ProviderHeaders) => ProviderHeaders | Promise<ProviderHeaders>
           const innerTransformHeaders = attemptOptions.transformHeaders as HeaderTransform | undefined
           attemptOptions.transformHeaders = async (requestHeaders: ProviderHeaders) => {
             const attributed = (await innerTransformHeaders?.(requestHeaders)) ?? requestHeaders
             const enriched: ProviderHeaders = { ...attributed }
             for (const [name, value] of Object.entries(
-              sessionAttributionHeaders(streamModel, dependencies.getAffinityKey()),
+              sessionAttributionHeaders(streamModel, affinityKey),
             )) {
               if (enriched[name] === undefined || enriched[name] === null) enriched[name] = value
             }

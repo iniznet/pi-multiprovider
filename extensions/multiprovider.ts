@@ -326,6 +326,7 @@ class VirtualProviderEditorDialog extends Container {
   private buildMenu(): void {
     const model = this.draft!.models[0]!
     const strategy = this.draft!.strategy ?? 'round-robin'
+    const affinity = this.draft!.affinity !== false
     const billingProviders = [...new Set(
       model.backends.filter(backend => backend.enabled !== false).map(backend => backend.providerId),
     )]
@@ -335,6 +336,7 @@ class VirtualProviderEditorDialog extends Container {
     const items: SettingItem[] = [
       this.menuItem('model-id', `Model id: ${model.id}`),
       this.menuItem('strategy', `Strategy: ${strategy}`),
+      this.menuItem('affinity', `Session affinity: ${affinity ? 'on (sticky per session)' : 'off (rotate)'}`),
       this.menuItem('add', 'Add backing provider model'),
       ...billingProviders.map(providerId => this.menuItem(
         'billing-' + providerId,
@@ -389,6 +391,13 @@ class VirtualProviderEditorDialog extends Container {
           const current = this.draft!.strategy ?? 'round-robin'
           const next = SELECTION_POLICIES[(SELECTION_POLICIES.indexOf(current) + 1) % SELECTION_POLICIES.length]!
           this.draft!.strategy = next
+          this.goTo({ kind: 'menu' })
+        } else if (id === 'affinity') {
+          // Off rotates backends by policy instead of reusing a session's first
+          // pick: for fan-out hosts whose nested agents share one session
+          // identity and would otherwise concentrate on one credential.
+          // Explicit /switch-account pins still take precedence.
+          this.draft!.affinity = this.draft!.affinity === false
           this.goTo({ kind: 'menu' })
         } else if (id.startsWith('billing-')) {
           const providerId = id.slice('billing-'.length)
@@ -1183,11 +1192,12 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     }
 
     if (current === priorLift && baseProviders.get(providerId) === base) return
-    const affinityKey = integration.affinityKey
-      ?? (() => ctx.sessionManager.getSessionId())
+    // A provider-owned key is a routing decision and wins outright; the host
+    // session is only the last-resort identity, so a nested agent that declares
+    // its own session on the stream options can scope stickiness to itself.
     const lifted = liftProvider(base, service, {
       ...integration,
-      affinityKey,
+      hostAffinityKey: () => ctx.sessionManager.getSessionId(),
       onFailover: handleFailover,
     })
     pi.registerProvider(lifted)
@@ -1282,9 +1292,13 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         unregisterSchedulers.get(integration.id)?.()
         unregisterSchedulers.set(integration.id, service.registerProvider(integration))
         virtualIntegrations.set(integration.id, integration)
-        // The strategy is persisted with the config and (re)applied on every
-        // load or edit; round-robin keeps the virtual pool's unbiased rotation.
-        await service.updatePool(integration.id, { policy: config.strategy ?? 'round-robin' })
+        // The strategy and session stickiness are persisted with the config and
+        // (re)applied on every load or edit; round-robin keeps the virtual pool's
+        // unbiased rotation, affinity off spreads a fan-out across backends.
+        await service.updatePool(integration.id, {
+          policy: config.strategy ?? 'round-robin',
+          affinity: config.affinity !== false,
+        })
       }
 
       const virtualProvider = createVirtualProvider({

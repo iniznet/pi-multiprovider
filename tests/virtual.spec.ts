@@ -19,6 +19,7 @@ import {
   createVirtualIntegrations,
   createVirtualProvider,
   healVirtualTemplates,
+  virtualBackendAccountId,
   type FailoverInfo,
   MultiProviderService,
   virtualSchedulerId,
@@ -230,6 +231,65 @@ async function collect(stream: AssistantMessageEventStream): Promise<AssistantMe
   for await (const event of stream) events.push(event)
   return events
 }
+
+describe('affinity scope', () => {
+  const served = { a: () => okStream('a'), b: () => okStream('b') }
+  const providersOf = (attempts: Attempt[]) => attempts.map(attempt => attempt.provider)
+
+  it('scopes stickiness to the requesting session when the caller declares one', async () => {
+    // pi core carries the requesting session's id on the stream options, so a
+    // host running nested AgentSessions (pi-fabric, a workflow runner) pins per
+    // agent instead of every caller inheriting one host-session backend.
+    const { virtual, attempts } = harness(served)
+    const model = virtual.getModels()[0]!
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    await collect(virtual.stream(model, context, { sessionId: 'agent-2' }))
+    expect(providersOf(attempts)).toEqual(['prov-a', 'prov-a', 'prov-b'])
+  })
+
+  it('falls back to the host session identity when the caller declares none', async () => {
+    const { virtual, attempts } = harness(served, { affinityKey: 'host-1' })
+    const model = virtual.getModels()[0]!
+    await collect(virtual.stream(model, context, { sessionId: '   ' }))
+    await collect(virtual.stream(model, context, undefined))
+    expect(providersOf(attempts)).toEqual(['prov-a', 'prov-a'])
+  })
+
+  it('rotates by policy rather than sharing one bucket with no identity at all', async () => {
+    // An empty host key used to be a valid affinity key: every identity-less
+    // caller would collide on it and inherit whichever backend came first.
+    const { virtual, attempts } = harness(served, { affinityKey: '' })
+    const model = virtual.getModels()[0]!
+    await collect(virtual.stream(model, context, undefined))
+    await collect(virtual.stream(model, context, undefined))
+    expect(providersOf(attempts)).toEqual(['prov-a', 'prov-b'])
+  })
+
+  it('spreads across backends when the pool disables session affinity', async () => {
+    const { virtual, service, attempts } = harness(served)
+    const model = virtual.getModels()[0]!
+    await service.updatePool(virtualSchedulerId('pooled', 'ultra'), { affinity: false })
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    expect(providersOf(attempts)).toEqual(['prov-a', 'prov-b'])
+  })
+
+  it('keeps an explicit account pin authoritative with affinity disabled', async () => {
+    const { virtual, service, attempts } = harness(served)
+    const model = virtual.getModels()[0]!
+    const schedulerId = virtualSchedulerId('pooled', 'ultra')
+    await service.updatePool(schedulerId, { affinity: false })
+    await service.pinAccount(
+      schedulerId,
+      'agent-1',
+      virtualBackendAccountId({ providerId: 'prov-b', modelId: 'model-b' }),
+    )
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    await collect(virtual.stream(model, context, { sessionId: 'agent-1' }))
+    expect(providersOf(attempts)).toEqual(['prov-b', 'prov-b'])
+  })
+})
 
 describe('virtual providers', () => {
   it('registers one unbiased scheduler per virtual model', async () => {

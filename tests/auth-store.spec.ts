@@ -365,6 +365,24 @@ describe('MultiAuthStore virtual providers', () => {
     expect(reloaded?.models[0]?.backends[0]?.priority).toBe(2)
   })
 
+  it('persists the virtual pool affinity opt-out and omits the default', async () => {
+    const { directory, store } = await storeFixture()
+    const path = join(directory, 'multiprovider-auth.json')
+    await store.saveVirtualProvider({ ...virtualConfig, affinity: false })
+    expect((await store.getVirtualProvider('pooled'))?.affinity).toBe(false)
+    expect(JSON.parse(await readFile(path, 'utf8')).virtuals.pooled.affinity).toBe(false)
+
+    await store.saveVirtualProvider({ ...virtualConfig, affinity: true })
+    // Affinity on is the default, so it is not written to disk at all.
+    expect(JSON.parse(await readFile(path, 'utf8')).virtuals.pooled.affinity).toBeUndefined()
+    expect((await new MultiAuthStore(path).getVirtualProvider('pooled'))?.affinity).toBeUndefined()
+
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      affinity: 'sticky' as unknown as boolean,
+    })).rejects.toThrow('malformed affinity')
+  })
+
   it('persists backend template compat flags and rejects malformed ones', async () => {
     const { directory, store } = await storeFixture()
     const compat = { supportsReasoningEffort: false, maxTokensField: 'max_tokens' } as const

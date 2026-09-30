@@ -14,6 +14,7 @@ import {
   type TranscriptContext,
 } from '@earendil-works/pi-ai'
 import { MultiProviderService } from './service.ts'
+import { affinityScope } from './affinity-scope.ts'
 import type {
   AccountLease,
   LiftProviderOptions,
@@ -135,7 +136,14 @@ function liftedStream<TApi extends Api, TCredentialRef>(
     )
     const maxAttempts = liftOptions.maxAccountAttempts ?? Number.MAX_SAFE_INTEGER
     const errorsBeforeSwitch = service.getErrorsBeforeSwitch()
-    const affinityKey = liftOptions.affinityKey?.({ provider, model, context })
+    // A caller-declared session (pi core sets `sessionId` on stream options for
+    // provider session routing) scopes stickiness to that agent, so a nested
+    // agent keeps its own account instead of inheriting the host's pin. An
+    // absent identity is dropped rather than shared as one empty bucket.
+    const provided = liftOptions.affinityKey?.({ provider, model, context })?.trim()
+    const affinityKey = provided === undefined || provided === ''
+      ? affinityScope(requestOptions, liftOptions.hostAffinityKey?.())
+      : provided
     let attempts = 0
     let lastRejected: BufferedTerminal | undefined
     let lastSetupError: unknown

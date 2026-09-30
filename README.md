@@ -121,6 +121,8 @@ First-account bias keeps every new session on the account listed first in the po
 
 Session affinity can pin a healthy account to the current Pi session. Explicit retry exclusions always win, so a rejected account is not selected twice for the same logical request. Switch strategies, affinity, and per-account weight and priority at any time inside `/multilogin`. `/switch-account` sets the pinned account explicitly for one session without touching these settings. Pi Fabric participant agents inherit that pin through `PI_MULTIPROVIDER_SESSION_PINS` and rebind it to the child session, so spawned workers keep the operator's chosen account.
 
+**Affinity is scoped to the requesting session, not to the process.** Pi core carries each request's session id on the stream options, so a nested agent that runs its own session — a Fabric participant, a workflow worker, an in-process sub-agent — gets its own sticky account instead of inheriting the host session's pin, and keeps it across its own turns. Precedence: an integration's own `affinityKey` (a deliberate routing decision) wins, then the caller-declared session, then the host session id. A request with no session identity at all selects purely by pool policy rather than sharing one bucket with every other identity-less caller.
+
 ### Error tolerance and failover compaction
 
 A rejected account is not abandoned on the first error. Each stream absorbs up to `errorsBeforeSwitch` (default **3**, configurable in the `/multilogin` Scheduler panel) pre-output errors on the same account—separated by a short pause—before releasing the lease, applying the failure cooldown, and moving to the next account. Errors after output has started and non-retryable failures surface immediately, exactly as before.
@@ -130,6 +132,8 @@ When [pi-fabric](https://github.com/monotykamary/pi-fabric) is installed, failin
 ## Virtual providers
 
 A virtual provider maps **one model to multiple provider models**. Sessions are spread across the backing providers with unbiased round robin—no first-provider favoritism—while session affinity pins each session to one backend, so prompt caches stay warm between requests and every subscription sees roughly its share of sessions.
+
+`/vprovider` exposes **Session affinity** per pool. Leave it on for interactive use; set it to `off (rotate)` when a fan-out host's nested agents share one session identity and you would rather spread them across backends than concentrate a burst on one credential. Explicit `/switch-account` pins take precedence either way.
 
 Create one with `/vprovider`:
 
@@ -293,6 +297,7 @@ Current limits:
 - A broken or revoked OAuth credential in Pi's primary `auth.json` can fail during Pi's pre-stream refresh before account selection. Repair that one through Pi's own `/login` (`/logout` first when the old credential blocks the flow) — multiprovider never writes it. Pooled credentials refresh independently and can be repaired in place with **Reauthenticate** in the `/multilogin` account submenu.
 - If both a stored pool and a provider-owned integration register for one ID, the stored pool wins and Pi displays a warning.
 - Provider-owned integrations with a custom `affinityKey` are invoked with a minimal context by `/switch-account`; keys that depend on request message history cannot be reproduced there and fall back to the Pi session id.
+- Pi **workflow subagents** (pi-dynamic-workflows) load no host extensions, so pooled and virtual providers are not registered inside their session: point those agents at a concrete `provider/model` instead of a virtual model id. In-process Fabric calls and Fabric participant processes do go through multiprovider's scheduler.
 
 ## Development
 
