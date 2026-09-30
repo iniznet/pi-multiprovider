@@ -24,6 +24,7 @@ import {
   virtualSchedulerId,
   type VirtualProviderConfig,
   type VirtualProviderDependencies,
+  type VirtualServedInfo,
 } from '../src/index.ts'
 import type { ProviderHeaders } from '@earendil-works/pi-ai'
 
@@ -722,6 +723,7 @@ describe('virtual providers', () => {
     }
     const httpAttempts: string[] = []
     const flagged: string[] = []
+    const served: string[] = []
     const service = new MultiProviderService({ randomInt: () => 0 })
     for (const integration of createVirtualIntegrations(config)) service.registerProvider(integration)
     const virtual = createVirtualProvider({
@@ -734,6 +736,7 @@ describe('virtual providers', () => {
           : backend('prov-b', reasoningB, model => { httpAttempts.push(model.provider + '/' + model.id); return okStream('from-b') }),
       resolveAmbientAuth: async () => ({ ok: true, apiKey: 'ambient' }),
       onBackendFatalMetadata: (providerId, modelId) => flagged.push(providerId + '/' + modelId),
+      onBackendServed: info => { served.push(info.providerId + '/' + info.modelId) },
     })
     const events = await collect(virtual.stream(virtual.getModels()[0]!, context, { reasoningEffort: 'high' }))
     // prov-a/model-a cannot serve high: skipped without an HTTP attempt;
@@ -742,7 +745,30 @@ describe('virtual providers', () => {
     // request at 'medium' should still be able to use prov-a.
     expect(httpAttempts).toEqual(['prov-b/model-b'])
     expect(flagged).toEqual([])
+    // A backend skipped pre-flight was never dispatched, so it is not
+    // reported as serving.
+    expect(served).toEqual(['prov-b/model-b'])
     expect(events.at(-1)).toMatchObject({ type: 'done' })
+  })
+
+  it('reports which backend a request is dispatched to, including failovers', async () => {
+    const served: VirtualServedInfo[] = []
+    const { virtual } = harness(
+      { a: () => errorStream('HTTP 500'), b: () => okStream('from-b') },
+      {},
+      {
+        errorsBeforeSwitch: 1,
+        deps: { onBackendServed: info => { served.push(info) } },
+      },
+    )
+    const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
+    expect(events.at(-1)).toMatchObject({ type: 'done' })
+    // The failed dispatch is reported first, then the backend that took over,
+    // so a status line always names who is serving right now.
+    expect(served).toEqual([
+      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-a', modelId: 'model-a' },
+      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-b', modelId: 'model-b' },
+    ])
   })
 
   it('allows non-reasoning backends to serve requests at any thinking level', async () => {

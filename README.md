@@ -106,6 +106,7 @@ Add as many accounts as you need from the same manager. Remove credentials from 
 | `/vprovider [id]` | Create and edit virtual providers that map one model across multiple provider models. |
 | `/accounts` | Inspect pool policy, account status, in-flight leases, failures, and cooldowns. |
 | `/switch-account [label]` | Pin this session to one pooled account of the current model's provider, or return to automatic selection. The choice is restored the next time the session is resumed. |
+| `/serving [on\|off]` | Show or hide the line above the editor naming which backing provider (and account) is serving the current virtual model; with no argument it reports the last dispatch. |
 
 ## Pool strategies
 
@@ -144,6 +145,11 @@ Behavior details:
 - Virtual provider configs are stored (credential-free) in `multiprovider-auth.json` next to the account pools.
 - Mixing backends from different model families is allowed, but the virtual model advertises the first healthy backend's context window and pricing, and prompt caches never transfer between providers.
 - Virtual models capture each backing model's metadata (reasoning support, thinking-level map, context window, pricing) when you pick it, so `/thinking` and per-model thinking memory (pi-model-sort) work across restarts and session resume — even before backing providers register. Stored configs are healed automatically on the next session start.
+- **Thinking levels are the union across backends.** The virtual model advertises every level at least one enabled backend can serve, so a mixed pool (say a `low/high/max` model beside a `low/medium/xhigh` one) still lets you select `high`. The chosen level is then routed by a per-attempt capability guard: a backend whose live model cannot serve it is skipped before any HTTP request is spent, and the pool narrows to the backends that can. Selecting the level permanently is your call — `/thinking`, then Ctrl+S in pi's dialog to store it as the default.
+- **Quota failures block the provider, not just the account.** Mark each backing provider with its billing cycle in `/vprovider` (`daily`, `weekly`, `monthly`, or a rolling `5h` window, with a configurable local reset hour for the calendar kinds). When a backend returns `402`/`429`/out-of-credit, every virtual backend on that provider is skipped — with zero HTTP spent — until the cycle resets; the marking persists in `multiprovider-auth.json`, so the block survives a restart. Unmarked providers fall back to the scheduler's quota cooldown.
+- **Providers that publish usage windows are probed directly.** For backends with a usage endpoint (opencode's `GET {baseUrl}/usage` today), each pooled account is polled on a slow cadence and after a quota failure: exhausted accounts are held out of selection until the API-reported reset, sibling accounts keep serving, and `/accounts` plus `/vprovider` show the remaining budget (`5h: 63% · 7d: 41% · 30d: 12%`).
+- **Metadata rejections are learned, not retried.** An upstream that rejects a model's declared parameters (a `400 invalid_request` such as `reasoning_effort is not allowed`) flags that `(provider, model)` pair for the rest of the process, surfaces the error once, and skips the pair on later requests. A thinking level a backend simply does not offer is *not* flagged — it is request-scoped, so lowering the level still uses every backend.
+- The line `↳ serving <provider> · <model> · <account>` above the editor names which backend a virtual model actually dispatched to, refreshed at dispatch time and on failover; `/serving off` hides it.
 
 ## Switching accounts for one session
 

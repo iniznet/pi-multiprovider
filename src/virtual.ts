@@ -109,6 +109,19 @@ export interface VirtualProviderDependencies {
   // rejections; flagged pairs are skipped for the rest of the process.
   isModelFlagged?: (providerId: string, modelId: string) => boolean
   onBackendFatalMetadata?: (providerId: string, modelId: string, failure: ProviderAttemptFailure) => void
+  // Names the backend a request was dispatched to, so a host can show which
+  // provider is actually serving the session. Fires at dispatch time: a
+  // failover re-reports with the backend that takes over.
+  onBackendServed?: (info: VirtualServedInfo) => void
+}
+
+// Which virtual model a session selected, and which backing provider/model
+// the scheduler dispatched it to.
+export interface VirtualServedInfo {
+  virtualProviderId: string
+  virtualModelId: string
+  providerId: string
+  modelId: string
 }
 
 export interface VirtualIntegrationOptions {
@@ -365,6 +378,15 @@ function virtualStream<TApi extends Api>(
             }
             return enriched
           }
+
+          // Report the backend before streaming so a status surface learns who
+          // is serving as the turn starts, not after it completes.
+          dependencies.onBackendServed?.({
+            virtualProviderId: config.id,
+            virtualModelId: model.id,
+            providerId: backend.providerId,
+            modelId: backend.modelId,
+          })
 
           // Same-account tolerance: pre-output retryable errors are absorbed
           // on the current backend until errorsBeforeSwitch is reached, so a

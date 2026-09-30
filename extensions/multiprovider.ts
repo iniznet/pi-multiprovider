@@ -946,6 +946,79 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   let pendingSessionPins: SessionPin[] = []
   let pendingInheritedSessionPins: InheritedSessionPin[] = []
 
+  // Serving line: pi's footer names the selected model, and for a virtual
+  // provider that name is a stable alias — the backing provider actually
+  // dispatched would otherwise be invisible. One line above the editor names
+  // who serves the turn, refreshed at dispatch time (so a failover repaints).
+  const SERVING_WIDGET_KEY = 'multiprovider:serving'
+  const servedBackends = new Map<string, { providerId: string; modelId: string; accountId?: string }>()
+  const accountLabels = new Map<string, string>()
+  let servingWidgetEnabled = true
+
+  const servedKey = (virtualProviderId: string, virtualModelId: string): string =>
+    virtualProviderId + VIRTUAL_ID_SEPARATOR + virtualModelId
+
+  // The backing provider's own pool picked an account for this session; the
+  // scheduler's affinity table names it. Undefined when the backing provider
+  // is not pooled (no scheduler entry) or the provider id is unknown.
+  const servedAccount = (providerId: string): { accountId?: string } => {
+    const sessionId = currentContext?.sessionManager.getSessionId()
+    if (sessionId === undefined) return {}
+    try {
+      const pin = service.getAffinity(providerId, sessionId)
+      if (pin === undefined) return {}
+      void resolveAccountLabel(providerId, pin.accountId)
+      return { accountId: pin.accountId }
+    } catch {
+      return {}
+    }
+  }
+
+  // Account labels live in the integration's account list; cache them so the
+  // widget renders synchronously from a repaint.
+  const resolveAccountLabel = async (providerId: string, accountId: string): Promise<void> => {
+    const key = providerId + VIRTUAL_ID_SEPARATOR + accountId
+    if (accountLabels.has(key)) return
+    const integration = effectiveIntegration(providerId)
+    if (integration === undefined) return
+    try {
+      for (const account of await integration.accounts()) {
+        accountLabels.set(providerId + VIRTUAL_ID_SEPARATOR + account.id, account.label)
+      }
+    } catch {
+      // A provider that cannot list accounts simply renders without a label.
+      return
+    }
+    // The label resolved after the dispatch-time paint; refresh the line so
+    // the account shows up on the turn that discovered it, not the next one.
+    if (currentContext !== undefined) renderServingWidget(currentContext)
+  }
+
+  const servingLine = (ctx: ExtensionContext): string | undefined => {
+    if (!servingWidgetEnabled) return undefined
+    const model = ctx.model
+    if (model === undefined) return undefined
+    const served = servedBackends.get(servedKey(model.provider, model.id))
+    if (served === undefined) return undefined
+    const providerName = baseProviders.get(served.providerId)?.name
+      ?? installedProviders.get(served.providerId)?.name
+      ?? served.providerId
+    const account = served.accountId === undefined
+      ? undefined
+      : accountLabels.get(served.providerId + VIRTUAL_ID_SEPARATOR + served.accountId)
+    return `\u21b3 serving ${providerName} \u00b7 ${served.modelId}` + (account === undefined ? '' : ` \u00b7 ${account}`)
+  }
+
+  const renderServingWidget = (ctx: ExtensionContext): void => {
+    try {
+      const line = servingLine(ctx)
+      if (line === undefined) ctx.ui.setWidget(SERVING_WIDGET_KEY, undefined)
+      else ctx.ui.setWidget(SERVING_WIDGET_KEY, [line])
+    } catch {
+      // A stale context can surface here; the next dispatch repaints.
+    }
+  }
+
   const effectiveIntegration = (providerId: string): AnyIntegration | undefined => {
     const managed = managedIntegrations.get(providerId)
     const external = externalIntegrations.get(providerId)
@@ -1222,6 +1295,17 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         onBackendQuotaFailure: (providerId, failure) => { void flagProviderQuotaBlock(providerId, failure) },
         isModelFlagged: (providerId, modelId) => flaggedBackends.has(providerId + VIRTUAL_ID_SEPARATOR + modelId),
         onBackendFatalMetadata: flagBackendIncompatible,
+        onBackendServed: info => {
+          servedBackends.set(servedKey(info.virtualProviderId, info.virtualModelId), {
+            providerId: info.providerId,
+            modelId: info.modelId,
+            ...servedAccount(info.providerId),
+          })
+          const ctx = currentContext
+          if (ctx?.model !== undefined
+            && ctx.model.provider === info.virtualProviderId
+            && ctx.model.id === info.virtualModelId) renderServingWidget(ctx)
+        },
         getAffinityKey: () => sessionContext()?.sessionManager.getSessionId() ?? '',
         getBackingProvider: providerId =>
           installedProviders.get(providerId)
@@ -1372,6 +1456,14 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       .filter((pin: InheritedSessionPin) => !recordedPools.has(pin.pool))
     await reconcile(ctx)
     announceService()
+    renderServingWidget(ctx)
+  })
+
+  // Switching models swaps the serving line to the new model's backend, or
+  // clears it when the selection is not a virtual model at all.
+  pi.on('model_select', (_event, ctx) => {
+    currentContext = ctx
+    renderServingWidget(ctx)
   })
 
   pi.on('before_agent_start', async (_event, ctx) => {
@@ -1390,7 +1482,29 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     virtualConfigs.clear()
     pendingSessionPins = []
     pendingInheritedSessionPins = []
+    servedBackends.clear()
+    accountLabels.clear()
     currentContext = undefined
+  })
+
+  pi.registerCommand('serving', {
+    description: 'Show or hide the line naming which backing provider serves this virtual model',
+    handler: async (args, ctx) => {
+      currentContext = ctx
+      const arg = args.trim().toLowerCase()
+      if (arg === 'on' || arg === 'off') {
+        servingWidgetEnabled = arg === 'on'
+        renderServingWidget(ctx)
+        ctx.ui.notify(servingWidgetEnabled
+          ? 'multiprovider: serving line enabled.'
+          : 'multiprovider: serving line hidden — bring it back with /serving on.', 'info')
+        return
+      }
+      const line = servingLine(ctx)
+      ctx.ui.notify(line === undefined
+        ? 'multiprovider: no virtual backend has served this session yet — select a virtual model and send a message.'
+        : `multiprovider: ${line}`, 'info')
+    },
   })
 
   pi.registerCommand('multilogin', {

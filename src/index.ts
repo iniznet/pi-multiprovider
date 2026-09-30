@@ -17,6 +17,7 @@ export {
   type AmbientAuthResolution,
   type VirtualIntegrationOptions,
   type VirtualProviderDependencies,
+  type VirtualServedInfo,
 } from './virtual.ts'
 export {
   computeResetAt,
