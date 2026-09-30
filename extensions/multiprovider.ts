@@ -42,12 +42,16 @@ import {
   PI_UPSTREAM_ACCOUNT_ID,
   SCHEDULER_DEFAULTS,
   VIRTUAL_ID_SEPARATOR,
+  SESSION_ATTACHMENT_REFRESH_MS,
   type AccountUsageSnapshot,
   type BillingPolicy,
   type ProviderAttemptFailure,
   type ModelThinkingLevel,
   type PublicPoolSnapshot,
   type AffinityEntry,
+  type VirtualServedInfo,
+  mergeAttachments,
+  virtualBackendAccountId,
   pickSuggestions,
   sessionsOn,
   type MultiAuthUpstreamPreferences,
@@ -1021,6 +1025,68 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     servedLevel?: ModelThinkingLevel
   }
 
+  // ---- shared session attachments -----------------------------------------
+  //
+  // Scheduler affinity is in-memory and per process, so a picker in one terminal
+  // tab cannot see the sessions other tabs are running — every row reads "no
+  // sessions" even with three of them streaming. Each dispatch mirrors this
+  // session's attachment into the shared store so the list is cross-process.
+  const attachmentWrites = new Map<string, { accountId: string; at: number }>()
+
+  const attachmentTrackKey = (poolId: string, key: string): string =>
+    poolId + VIRTUAL_ID_SEPARATOR + key
+
+  const recordAttachment = async (
+    poolId: string,
+    key: string,
+    accountId: string,
+    label: string | undefined,
+    explicit: boolean,
+  ): Promise<void> => {
+    if (key === '') return
+    const trackKey = attachmentTrackKey(poolId, key)
+    try {
+      await store.recordSessionAttachment(poolId, key, {
+        accountId,
+        ...(label === undefined ? {} : { label }),
+        explicit,
+      })
+      attachmentWrites.set(trackKey, { accountId, at: Date.now() })
+    } catch {
+      // The local scheduler stays authoritative for this process; a failed
+      // mirror only costs other processes a row they will not see yet.
+      attachmentWrites.delete(trackKey)
+    }
+  }
+
+  // Throttled mirror of a dispatch's pin. An unchanged attachment is rewritten
+  // only often enough to keep its row alive, never once per turn.
+  const recordServedAttachment = (info: VirtualServedInfo): void => {
+    const key = info.affinityKey
+    if (key === undefined || key === '') return
+    const poolId = virtualSchedulerId(info.virtualProviderId, info.virtualModelId)
+    const accountId = virtualBackendAccountId({ providerId: info.providerId, modelId: info.modelId })
+    const prior = attachmentWrites.get(attachmentTrackKey(poolId, key))
+    const now = Date.now()
+    if (prior !== undefined && prior.accountId === accountId && now - prior.at < SESSION_ATTACHMENT_REFRESH_MS) {
+      return
+    }
+    const label = (baseProviders.get(info.providerId)?.name
+      ?? installedProviders.get(info.providerId)?.name
+      ?? info.providerId) + ' · ' + info.modelId
+    void recordAttachment(poolId, key, accountId, label, service.getAffinity(poolId, key)?.explicit === true)
+  }
+
+  // Local pins plus every other process's mirrored rows, newest first.
+  const attachmentView = async (poolId: string): Promise<AffinityEntry[]> => {
+    const local = service.affinityEntries(poolId)
+    try {
+      return mergeAttachments(local, await store.listSessionAttachments(), poolId)
+    } catch {
+      return local
+    }
+  }
+
   const servedBackends = new Map<string, ServedBackend>()
   const accountLabels = new Map<string, string>()
   let servingWidgetEnabled = true
@@ -1309,6 +1375,17 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   // Virtual providers round-robin sessions across backing provider models with
   // no first-provider bias; session affinity pins a session to one backend so
   // prompt caches stay warm between hops.
+  // Canonical form of a virtual config for change detection. Key order can differ
+  // between the object this process holds and the one the store rewrote (a healed
+  // template appends `compat` last; normalization emits it mid-object), and a
+  // false mismatch here re-registers the pool — which drops every session pin in
+  // this process. Compare a key-sorted form so only a real change churns.
+  const canonicalConfigKey = (config: VirtualProviderConfig): string => JSON.stringify(config,
+    (_key, value) => (value !== null && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+        .map(name => [name, (value as Record<string, unknown>)[name]]))
+      : value))
+
   const refreshVirtual = async (): Promise<void> => {
     const stored = await store.listVirtualProviders()
     const storedIds = new Set(stored.map(config => config.id))
@@ -1345,7 +1422,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       }
       const config = healed ?? storedConfig
       const prior = virtualConfigs.get(config.id)
-      if (prior !== undefined && JSON.stringify(prior) === JSON.stringify(config)) continue
+      if (prior !== undefined && canonicalConfigKey(prior) === canonicalConfigKey(config)) continue
       if (prior !== undefined) unregisterVirtualModels(prior)
 
       // Registration runs at extension load, before any session exists; the
@@ -1389,6 +1466,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           if (ctx?.model !== undefined
             && ctx.model.provider === info.virtualProviderId
             && ctx.model.id === info.virtualModelId) renderServingWidget(ctx)
+          void recordServedAttachment(info)
         },
         getAffinityKey: () => sessionContext()?.sessionManager.getSessionId() ?? '',
         getBackingProvider: providerId =>
@@ -1916,7 +1994,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           ? 'upstream'
           : account.status === 'cooldown' ? 'cooling down' : account.authKind,
       })),
-      pins: service.affinityEntries(target.poolId),
+      pins: await attachmentView(target.poolId),
       currentKey: target.affinityKey,
       currentId: target.currentId,
       policy: target.pool.policy,
@@ -1972,7 +2050,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         if (!ctx.hasUI) {
           earlyPick = true
         } else {
-          const pins = service.affinityEntries(poolId)
+          const pins = await attachmentView(poolId)
           const labels = [
             `Automatic · let the ${pool.policy} strategy pick the next account`,
             `Pick now · run the ${pool.policy} strategy and keep the result`,
@@ -1990,6 +2068,10 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
 
       if (automatic) {
         service.clearAffinity(poolId, affinityKey)
+        // Withdraw the mirrored row too, or other processes keep showing a
+        // session that has just gone automatic.
+        void store.clearSessionAttachment(poolId, affinityKey).catch(() => undefined)
+        attachmentWrites.delete(poolId + VIRTUAL_ID_SEPARATOR + affinityKey)
         pi.appendEntry(SESSION_PIN_ENTRY_TYPE, { pool: poolId, key: affinityKey })
         await announceSwitch()
         ctx.ui.notify(
@@ -2023,7 +2105,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           label: pickedLabel,
         })
         await announceSwitch()
-        const attached = sessionsOn(service.affinityEntries(poolId), pickedAccountId, affinityKey)
+        const attached = sessionsOn(await attachmentView(poolId), pickedAccountId, affinityKey)
         ctx.ui.notify(
           `multiprovider: the ${pool.policy} strategy picked ${pickedLabel} for this session`
             + ` (${attached ?? 'first session here'}).`,
@@ -2052,6 +2134,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         accountId: account.id,
         label: account.label,
       })
+      // Mirror immediately: an explicit switch is a decision other processes
+      // should see before this session's next request, not after it.
+      void recordAttachment(poolId, affinityKey, account.id, account.label, true)
       await announceSwitch()
       const cooldown = account.cooldownUntil === undefined
         ? ''

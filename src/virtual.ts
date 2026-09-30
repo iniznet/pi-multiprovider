@@ -135,6 +135,8 @@ export interface VirtualServedInfo {
   requestedLevel?: ModelThinkingLevel
   /** The level actually sent: equal unless the backend could not serve it. */
   servedLevel?: ModelThinkingLevel
+  /** Affinity scope this dispatch pinned under, for the shared registry. */
+  affinityKey?: string
 }
 
 export interface VirtualIntegrationOptions {
@@ -424,6 +426,7 @@ function virtualStream<TApi extends Api>(
             modelId: backend.modelId,
             ...(requestedLevel === undefined ? {} : { requestedLevel }),
             ...(servedLevel === undefined ? {} : { servedLevel }),
+            ...(affinityKey === undefined ? {} : { affinityKey }),
           })
 
           // Same-account tolerance: pre-output retryable errors are absorbed

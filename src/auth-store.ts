@@ -11,12 +11,19 @@ import type {
   Provider,
 } from '@earendil-works/pi-ai'
 import { getAgentDir } from '@earendil-works/pi-coding-agent'
-import { SELECTION_POLICIES, SCHEDULER_SETTING_KEYS } from './types.ts'
+import {
+  SELECTION_POLICIES,
+  SCHEDULER_SETTING_KEYS,
+  SESSION_ATTACHMENT_TTL_MS,
+  SESSION_ATTACHMENTS_PER_POOL_LIMIT,
+} from './types.ts'
 import { normalizeProviderQuotaEntry, normalizeBillingPolicy } from './quota.ts'
 import type {
   AuthKind,
   BillingPolicy,
   ProviderQuotaState,
+  SessionAttachment,
+  SessionAttachmentEntry,
   SchedulerSettings,
   SchedulerSettingsPatch,
   SelectionPolicy,
@@ -101,6 +108,9 @@ interface PersistedState {
   providers: Record<string, PersistedPool>
   virtuals?: Record<string, VirtualProviderConfig>
   providerQuota?: Record<string, PersistedProviderQuota>
+  // pool id -> session key -> attachment. Cross-process view of who is
+  // serving what; carries session ids, account ids, and labels only.
+  sessions?: Record<string, Record<string, SessionAttachment>>
 }
 
 const DEFAULT_POLICY: SelectionPolicy = 'round-robin'
@@ -128,6 +138,22 @@ function normalizeProviderQuota(value: unknown): Record<string, PersistedProvide
 
 function assertSafeKey(value: string, label: string): void {
   if (value.trim() === '' || unsafeKeys.has(value)) throw new Error(`multiprovider: invalid ${label}`)
+}
+
+// A stored attachment is read back on every list, so its shape is validated at
+// load: a hand-edited or half-written row must fail loudly rather than render a
+// bogus session count.
+function assertSessionAttachment(value: unknown, poolId: string): asserts value is SessionAttachment {
+  if (typeof value !== 'object' || value === null) {
+    throw new Error(`multiprovider: malformed session attachment in "${poolId}"`)
+  }
+  const candidate = value as Partial<SessionAttachment>
+  if (typeof candidate.accountId !== 'string' || candidate.accountId === ''
+    || typeof candidate.explicit !== 'boolean'
+    || typeof candidate.updatedAt !== 'number' || !Number.isFinite(candidate.updatedAt)
+    || (candidate.label !== undefined && typeof candidate.label !== 'string')) {
+    throw new Error(`multiprovider: malformed session attachment in "${poolId}"`)
+  }
 }
 
 function assertCredential(value: unknown): asserts value is Credential {
@@ -350,6 +376,22 @@ function parseState(text: string): PersistedState {
   if (candidate.virtuals !== undefined) {
     for (const virtualValue of Object.values(candidate.virtuals)) {
       normalizeVirtualProvider(virtualValue)
+    }
+  }
+  if (candidate.sessions !== undefined) {
+    if (typeof candidate.sessions !== 'object' || candidate.sessions === null
+      || Array.isArray(candidate.sessions)) {
+      throw new Error('multiprovider: malformed session attachments')
+    }
+    for (const [poolId, byKey] of Object.entries(candidate.sessions)) {
+      assertSafeKey(poolId, 'pool id')
+      if (typeof byKey !== 'object' || byKey === null || Array.isArray(byKey)) {
+        throw new Error(`multiprovider: malformed session attachments for "${poolId}"`)
+      }
+      for (const [key, attachment] of Object.entries(byKey)) {
+        assertSafeKey(key, 'session key')
+        assertSessionAttachment(attachment, poolId)
+      }
     }
   }
   if (candidate.providerQuota !== undefined) {
@@ -708,6 +750,72 @@ export class MultiAuthStore {
       delete entry.reason
       if (Object.keys(entry).length === 0) delete state.providerQuota![providerId]
       if (Object.keys(state.providerQuota!).length === 0) delete state.providerQuota
+      return true
+    })
+  }
+
+  // ---- shared session attachments -----------------------------------------
+  //
+  // Scheduler affinity is in-memory and per process, so a picker in one terminal
+  // tab cannot see the sessions other tabs are running. These rows mirror each
+  // session's current attachment into the shared store — the only cross-process
+  // view of who is serving what. Session ids, account ids, and labels: no
+  // credential material of any kind.
+
+  async listSessionAttachments(
+    ttlMs: number = SESSION_ATTACHMENT_TTL_MS,
+    now: number = Date.now(),
+  ): Promise<SessionAttachmentEntry[]> {
+    const state = await this.readState()
+    const entries: SessionAttachmentEntry[] = []
+    for (const [poolId, byKey] of Object.entries(state.sessions ?? {})) {
+      for (const [key, attachment] of Object.entries(byKey)) {
+        if (now - attachment.updatedAt > ttlMs) continue
+        entries.push({ poolId, key, ...attachment })
+      }
+    }
+    return entries.sort((left, right) => right.updatedAt - left.updatedAt)
+  }
+
+  async recordSessionAttachment(
+    poolId: string,
+    key: string,
+    attachment: Omit<SessionAttachment, 'updatedAt'>,
+    now: number = Date.now(),
+  ): Promise<void> {
+    assertSafeKey(poolId, 'pool id')
+    assertSafeKey(key, 'session key')
+    await this.mutate(state => {
+      const sessions: Record<string, Record<string, SessionAttachment>> = {}
+      for (const [existingPool, byKey] of Object.entries(state.sessions ?? {})) {
+        // Opportunistic pruning: a closed tab never clears its own row, so a
+        // write is the natural moment to drop rows nobody has refreshed.
+        const fresh = Object.entries(byKey).filter(([, stored]) =>
+          now - stored.updatedAt <= SESSION_ATTACHMENT_TTL_MS)
+        if (fresh.length > 0) sessions[existingPool] = Object.fromEntries(fresh)
+      }
+      const kept = sessions[poolId] ?? {}
+      kept[key] = { ...attachment, updatedAt: now }
+      // Bound growth per pool, newest first, so the file cannot grow without end.
+      const ordered = Object.entries(kept)
+        .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+        .slice(0, SESSION_ATTACHMENTS_PER_POOL_LIMIT)
+      sessions[poolId] = Object.fromEntries(ordered)
+      state.sessions = sessions
+    })
+  }
+
+  async clearSessionAttachment(poolId: string, key: string): Promise<boolean> {
+    assertSafeKey(poolId, 'pool id')
+    assertSafeKey(key, 'session key')
+    return this.mutate(state => {
+      const byKey = state.sessions?.[poolId]
+      if (byKey === undefined || !(key in byKey)) return false
+      delete byKey[key]
+      if (Object.keys(byKey).length === 0) delete state.sessions![poolId]
+      if (state.sessions !== undefined && Object.keys(state.sessions).length === 0) {
+        delete state.sessions
+      }
       return true
     })
   }

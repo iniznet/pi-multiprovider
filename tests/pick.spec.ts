@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { pickSuggestions, sessionsOn, type AffinityEntry } from '../src/index.ts'
+import { mergeAttachments, pickSuggestions, sessionsOn, type AffinityEntry } from '../src/index.ts'
 
 const pins = (entries: [string, string][]): AffinityEntry[] =>
   entries.map(([key, accountId]) => ({ key, accountId, explicit: false }))
@@ -11,6 +11,27 @@ describe('pick suggestions', () => {
     expect(sessionsOn(pins([['current', 'a'], ['s2', 'a']]), 'a', 'current'))
       .toBe('this session + 1 other')
     expect(sessionsOn(pins([['s2', 'a']]), 'b', 'current')).toBeUndefined()
+  })
+
+  it('merges local pins with mirrored rows from other processes', () => {
+    const merged = mergeAttachments(
+      [{ key: 'self', accountId: 'a', explicit: false }],
+      [
+        // A stale mirror of this very session must not double-count or override
+        // the authoritative local entry.
+        { poolId: 'p', key: 'self', accountId: 'b', explicit: false, updatedAt: 1 },
+        { poolId: 'p', key: 'tab-2', accountId: 'a', explicit: true, updatedAt: 2 },
+        { poolId: 'other', key: 'tab-3', accountId: 'c', explicit: false, updatedAt: 3 },
+      ],
+      'p',
+    )
+    expect(merged).toEqual([
+      { key: 'self', accountId: 'a', explicit: false, remote: false },
+      { key: 'tab-2', accountId: 'a', explicit: true, remote: true },
+    ])
+    // The wording a picker shows covers other processes' sessions.
+    expect(sessionsOn(merged, 'a', 'self')).toBe('this session + 1 other')
+    expect(sessionsOn(merged, 'c', 'self')).toBeUndefined()
   })
 
   it('lists the automatic modes first, then one row per candidate', () => {

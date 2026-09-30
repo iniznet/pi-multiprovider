@@ -10,6 +10,8 @@ import {
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   MultiAuthStore,
+  SESSION_ATTACHMENTS_PER_POOL_LIMIT,
+  SESSION_ATTACHMENT_TTL_MS,
   type SelectionPolicy,
   type VirtualModelTemplate,
   type VirtualProviderConfig,
@@ -363,6 +365,65 @@ describe('MultiAuthStore virtual providers', () => {
       .getVirtualProvider('pooled')
     expect(reloaded?.strategy).toBe('priority')
     expect(reloaded?.models[0]?.backends[0]?.priority).toBe(2)
+  })
+
+  it('records, TTL-prunes, and clears shared session attachments', async () => {
+    const { directory, store } = await storeFixture()
+    const path = join(directory, 'multiprovider-auth.json')
+    await store.recordSessionAttachment('pooled::ultra', 'session-1',
+      { accountId: 'hypercharm::glm', label: 'HyperCharm · glm', explicit: false }, 1_000)
+    await store.recordSessionAttachment('pooled::ultra', 'session-2',
+      { accountId: 'commandcode::glm', explicit: true }, 2_000)
+    await store.recordSessionAttachment('other::model', 'session-3',
+      { accountId: 'a', explicit: false }, 3_000)
+
+    const all = await store.listSessionAttachments(Number.MAX_SAFE_INTEGER, 4_000)
+    expect(all.map(entry => entry.poolId + '/' + entry.key))
+      .toEqual(['other::model/session-3', 'pooled::ultra/session-2', 'pooled::ultra/session-1'])
+
+    // Freshness is the only cross-process liveness signal pi has: a row nobody
+    // refreshed disappears, and the next write drops it from disk too.
+    expect((await store.listSessionAttachments(2_000, 4_000)).map(entry => entry.key))
+      .toEqual(['session-3', 'session-2'])
+    // A write is the natural moment to drop rows nobody has refreshed: a closed
+    // tab never clears its own attachment.
+    await store.recordSessionAttachment('pooled::ultra', 'session-4',
+      { accountId: 'b', explicit: false }, SESSION_ATTACHMENT_TTL_MS + 10_000)
+    const after = JSON.parse(await readFile(path, 'utf8'))
+    expect(Object.keys(after.sessions)).toEqual(['pooled::ultra'])
+    expect(Object.keys(after.sessions['pooled::ultra'])).toEqual(['session-4'])
+
+    expect(await store.clearSessionAttachment('pooled::ultra', 'session-4')).toBe(true)
+    expect(await store.clearSessionAttachment('pooled::ultra', 'session-4')).toBe(false)
+    // An attachment never carries credential material.
+    const emptied = JSON.parse(await readFile(path, 'utf8'))
+    expect(emptied.sessions).toBeUndefined()
+    await store.recordSessionAttachment('pooled::ultra', 'session-5',
+      { accountId: 'a', label: 'Alpha', explicit: false }, 1)
+    const stored = JSON.parse(await readFile(path, 'utf8'))
+    expect(Object.keys(stored.sessions['pooled::ultra']['session-5']).sort())
+      .toEqual(['accountId', 'explicit', 'label', 'updatedAt'])
+  })
+
+  it('bounds stored sessions per pool and rejects malformed attachments', async () => {
+    const { directory, store } = await storeFixture()
+    const path = join(directory, 'multiprovider-auth.json')
+    for (let index = 0; index <= SESSION_ATTACHMENTS_PER_POOL_LIMIT; index += 1) {
+      await store.recordSessionAttachment('pooled::ultra', 'session-' + index,
+        { accountId: 'a', explicit: false }, 1_000 + index)
+    }
+    const kept = await store.listSessionAttachments(Number.MAX_SAFE_INTEGER, 2_000)
+    expect(kept).toHaveLength(SESSION_ATTACHMENTS_PER_POOL_LIMIT)
+    // The oldest row is the one dropped.
+    expect(kept.some(entry => entry.key === 'session-0')).toBe(false)
+
+    await writeFile(path, JSON.stringify({
+      version: 1,
+      providers: {},
+      sessions: { pooled: { 'session-1': { accountId: '', explicit: false, updatedAt: 1 } } },
+    }))
+    await expect(new MultiAuthStore(path).listSessionAttachments())
+      .rejects.toThrow('malformed session attachment')
   })
 
   it('persists the virtual pool affinity opt-out and omits the default', async () => {

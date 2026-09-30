@@ -54,8 +54,10 @@ export {
   type ServiceAnnouncementHandle,
 } from './announcement.ts'
 export {
+  mergeAttachments,
   pickSuggestions,
   sessionsOn,
+  type AttachmentView,
   type PickCandidate,
   type PickSuggestion,
   type PickSuggestionInput,

@@ -92,6 +92,38 @@ export interface AffinityEntry extends AffinityPin {
   key: string
 }
 
+// A session's attachment mirrored into the shared store. Scheduler affinity is
+// in-memory and per process: another terminal tab, or this tab after a reload,
+// cannot see it. The registry is the only cross-process view of who is serving
+// what, which is what a picker needs before landing a new agent somewhere.
+export interface SessionAttachment {
+  accountId: string
+  /** Account label, so a viewer without this pool loaded can still name it. */
+  label?: string
+  /** True when set by an explicit switch rather than by session affinity. */
+  explicit: boolean
+  /** Epoch ms of the last dispatch that confirmed this attachment. */
+  updatedAt: number
+}
+
+export interface SessionAttachmentEntry extends SessionAttachment {
+  poolId: string
+  key: string
+}
+
+// pi keeps no cross-process liveness signal, so freshness is the only proxy for
+// "still open": a session that has not dispatched for this long is treated as
+// gone and simply re-registers on its next request.
+export const SESSION_ATTACHMENT_TTL_MS = 30 * 60_000
+
+// Re-mirror an unchanged attachment at most this often: keeps a long-lived
+// session's row alive without one store write per turn.
+export const SESSION_ATTACHMENT_REFRESH_MS = 5 * 60_000
+
+// Bound on stored sessions per pool, newest first, so a busy machine cannot
+// grow the shared file without limit.
+export const SESSION_ATTACHMENTS_PER_POOL_LIMIT = 64
+
 export interface AcquireOptions {
   providerId: string
   affinityKey?: string

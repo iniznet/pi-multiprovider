@@ -1,4 +1,4 @@
-import type { AffinityEntry } from './types.ts'
+import type { AffinityEntry, SessionAttachmentEntry } from './types.ts'
 
 // Argument suggestions for the switch/pick command. Structurally matches pi's
 // AutocompleteItem ({ value, label, description? }) so src stays free of the
@@ -14,6 +14,37 @@ export interface PickCandidate {
   label: string
   /** Provider/auth detail shown alongside the label. */
   detail?: string
+}
+
+export interface AttachmentView extends AffinityEntry {
+  /** True when the row came from another pi process via the shared store. */
+  remote: boolean
+}
+
+/**
+ * Local scheduler affinity merged with the shared registry, so a list shows the
+ * sessions every open pi process is running rather than only this one. Local
+ * entries win on conflict: they are authoritative and current, while a mirrored
+ * row can predate a switch this process has already made.
+ */
+export function mergeAttachments(
+  local: readonly AffinityEntry[],
+  mirrored: readonly SessionAttachmentEntry[],
+  poolId: string,
+): AttachmentView[] {
+  const merged: AttachmentView[] = local.map(entry => ({ ...entry, remote: false }))
+  const seen = new Set(local.map(entry => entry.key))
+  for (const entry of mirrored) {
+    if (entry.poolId !== poolId || seen.has(entry.key)) continue
+    seen.add(entry.key)
+    merged.push({
+      key: entry.key,
+      accountId: entry.accountId,
+      explicit: entry.explicit,
+      remote: true,
+    })
+  }
+  return merged
 }
 
 /**

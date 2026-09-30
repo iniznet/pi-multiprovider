@@ -915,11 +915,17 @@ describe('virtual providers', () => {
     const events = await collect(virtual.stream(virtual.getModels()[0]!, context))
     expect(events.at(-1)).toMatchObject({ type: 'done' })
     // The failed dispatch is reported first, then the backend that took over,
-    // so a status line always names who is serving right now.
+    // so a status line always names who is serving right now. The affinity key
+    // rides along because that is what the shared attachment registry is keyed
+    // by — the host cannot recompute it from the backend identity alone.
     expect(served).toEqual([
-      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-a', modelId: 'model-a' },
-      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-b', modelId: 'model-b' },
+      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-a', modelId: 'model-a', affinityKey: 'session-1' },
+      { virtualProviderId: 'pooled', virtualModelId: 'ultra', providerId: 'prov-b', modelId: 'model-b', affinityKey: 'session-1' },
     ])
+    // A caller that declares its own session (a nested agent) is reported under
+    // that scope, not the host's.
+    await collect(virtual.stream(virtual.getModels()[0]!, context, { sessionId: 'agent-9' }))
+    expect(served.at(-1)).toMatchObject({ affinityKey: 'agent-9' })
   })
 
   it('allows non-reasoning backends to serve requests at any thinking level', async () => {

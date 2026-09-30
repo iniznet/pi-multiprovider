@@ -129,7 +129,17 @@ A rejected account is not abandoned on the first error. Each stream absorbs up t
 
 When [pi-fabric](https://github.com/monotykamary/pi-fabric) is installed, failing over to a different account first compacts the session with fabric's deterministic, LLM-free compaction engine. The failing request surfaces its error, the session compacts while the retry backoff runs, and the retry lands on the next account with a small context instead of a huge cold prefill. This is the default behavior; without fabric installed, streams rotate accounts inline as before.
 
-## Virtual providers
+### Shared session attachments
+
+Scheduler affinity lives in memory, per process — so a picker in one terminal tab cannot see what the other three tabs are running, and every row reads `no sessions` even while they stream. To fix that, each dispatch mirrors its pin into `multiprovider-auth.json` under `sessions`, and every list merges the local table with those mirrored rows:
+
+- **What is stored**: pool id, session id, account id, account label, whether the pin was explicit, and a timestamp. No credential material of any kind.
+- **Write pressure**: an unchanged pin is re-mirrored at most every 5 minutes, not once per turn. Explicit switches and clears write immediately, because those are decisions other processes should see at once.
+- **Liveness**: pi has no cross-process "is that tab still open" signal, so freshness is the proxy — a row nobody refreshed for 30 minutes is treated as closed and dropped on the next write. A session that wakes up re-registers on its next request.
+- **Growth**: bounded per pool (newest 64 sessions), so a busy machine cannot grow the file without limit.
+- **Authority**: the local table always wins for its own session. A mirrored row can predate a switch this process just made, so merging never lets stale disk data override live state.
+
+## Virtual providers## Virtual providers
 
 A virtual provider maps **one model to multiple provider models**. Sessions are spread across the backing providers with unbiased round robin—no first-provider favoritism—while session affinity pins each session to one backend, so prompt caches stay warm between requests and every subscription sees roughly its share of sessions.
 
@@ -165,7 +175,7 @@ Behavior details:
 - **Automatic**—or `/switch-account auto`—clears the pin so the pool strategy selects again; the cleared state is recorded too, so a resumed session stays automatic.
 - `/switch-account work` switches directly when the label matches exactly or by unique prefix.
 - **Pick now** — `/switch-account pick` — runs the pool's configured strategy immediately and pins the result, so you can see where a session will land before spending a request on it. The probe records no health against the account. In a non-interactive session (headless or RPC) there is no menu to open, so the command picks by strategy when given no argument at all.
-- **Autocompletion**: start `/switch-account ` and pi lists `auto`, `pick`, then every account with its state and who is on it — `current`, `this session + 2 others`, or `no sessions`. That is how you find an idle credential in a fan-out instead of stacking every agent onto one.
+- **Autocompletion**: start `/switch-account ` and pi lists `auto`, `pick`, then every account with its state and who is on it — `current`, `this session + 2 others`, or `no sessions`. That is how you find an idle credential in a fan-out instead of stacking every agent onto one. The counts include sessions in **other pi processes**; see [Shared session attachments](#shared-session-attachments).
 - If the pinned account was removed or disabled before the session is resumed, the session warns once and falls back to automatic selection.
 
 In-flight requests keep their leased account; only new requests observe the switch. Sibling extensions can follow switches—and the account a resumed session restores—through the [`pi-multiprovider:service` event](#session-account-service-event).
