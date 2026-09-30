@@ -316,6 +316,17 @@ export class MultiProviderService {
     delete runtime.lastFailureKind
   }
 
+  // Probe-driven quota blocking: a usage probe found this account's meter
+  // window exhausted, so hold it out of selection until the API-reported
+  // reset instead of waiting for a failed request to trigger a cooldown.
+  coolAccountUntil(providerId: string, accountId: string, until: number): void {
+    this.registration(providerId)
+    const runtime = this.runtimeFor(providerId, accountId)
+    if (until <= runtime.cooldownUntil) return
+    runtime.cooldownUntil = until
+    runtime.lastFailureKind = 'quota'
+  }
+
   async pinAccount(providerId: string, affinityKey: string, accountId: string): Promise<void> {
     const registration = this.registration(providerId)
     const pool = this.pool(providerId)

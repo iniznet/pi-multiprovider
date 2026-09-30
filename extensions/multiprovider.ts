@@ -22,11 +22,17 @@ import {
   BACKEND_INCOMPATIBLE_PREFIX,
   BACKEND_QUOTA_BLOCKED_PREFIX,
   BILLING_RESET_KINDS,
+  bearerTokenFromAuth,
   computeResetAt,
+  createHttpUsageProbe,
   createManagedIntegration,
   describeBillingPolicy,
   createServiceAnnouncement,
+  detectUsageUrl,
   getMultiAuthPath,
+  USAGE_WINDOW_FALLBACK_MS,
+  UsageProbeCache,
+  type UsageProbe,
   type FailoverInfo,
   liftProvider,
   MULTIPROVIDER_REGISTER_EVENT,
@@ -741,8 +747,127 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
     return false
   }
 
+  // Usage probes: providers that publish per-account meter windows (opencode's
+  // GET {baseUrl}/usage) let exhausted accounts be blocked BEFORE an HTTP
+  // attempt is spent, with the API-reported reset instead of a billing
+  // estimate. Probing is best-effort; any failure falls back to the reactive
+  // billing-mark path below.
+  const usageCache = new UsageProbeCache()
+  const probeBlocks = new Map<string, number>()
+
+  const providerUsageProbe = (
+    providerId: string,
+  ): { integration: AnyIntegration; provider: Provider<Api>; probe: UsageProbe } | undefined => {
+    const integration = effectiveIntegration(providerId)
+    if (integration === undefined) return undefined
+    const provider = baseProviders.get(providerId)
+      ?? installedProviders.get(providerId)
+      ?? (currentContext?.modelRegistry.getProvider(providerId) as Provider<Api> | undefined)
+    const url = detectUsageUrl(provider?.getModels()[0]?.baseUrl)
+    if (provider === undefined || url === undefined) return undefined
+    return { integration, provider, probe: createHttpUsageProbe(url) }
+  }
+
+  // Refresh (respecting the TTL unless forced) every account of a
+  // probe-capable provider and block exhausted accounts until their reported
+  // reset. Returns undefined when the provider has no usable probe.
+  const probeAccountsUsage = async (
+    providerId: string,
+    force: boolean,
+  ): Promise<{ until: number; allLimited: boolean } | undefined> => {
+    const capable = providerUsageProbe(providerId)
+    if (capable === undefined) return undefined
+    const { integration, provider, probe } = capable
+    let accounts
+    try {
+      accounts = await integration.accounts()
+    } catch {
+      return undefined
+    }
+    const model = provider.getModels()[0]
+    if (model === undefined) return undefined
+    const now = Date.now()
+    let until: number | undefined
+    let probedCount = 0
+    let limitedCount = 0
+    for (const account of accounts) {
+      let token: string | undefined
+      try {
+        const signal = AbortSignal.timeout(10_000)
+        const resolution = await integration.resolveAuth(account, signal, {
+          provider,
+          model,
+          context: normalizeContext({ messages: [] }),
+          requestOptions: {},
+          signal,
+        })
+        token = bearerTokenFromAuth(resolution)
+      } catch {
+        continue
+      }
+      if (token === undefined) continue
+      const snapshot = await usageCache.refresh(providerId, account.id, probe, token, force)
+      if (snapshot === undefined) continue
+      probedCount += 1
+      if (!snapshot.isLimited) continue
+      limitedCount += 1
+      const resets = snapshot.windows
+        .filter(window => window.rateLimited)
+        .map(window => window.resetsAt ?? now + (USAGE_WINDOW_FALLBACK_MS[window.key] ?? USAGE_WINDOW_FALLBACK_MS.rolling!))
+      const accountUntil = resets.length === 0 ? undefined : Math.min(...resets)
+      if (accountUntil === undefined) continue
+      service.coolAccountUntil(providerId, account.id, accountUntil)
+      const key = providerId + VIRTUAL_ID_SEPARATOR + account.id
+      if ((probeBlocks.get(key) ?? 0) <= now) {
+        currentContext?.ui.notify(
+          `multiprovider: account "${account.label ?? account.id}" on "${providerId}" is out of usage until ${new Date(accountUntil).toLocaleString()}`,
+          'warning',
+        )
+      }
+      probeBlocks.set(key, accountUntil)
+      until = until === undefined ? accountUntil : Math.min(until, accountUntil)
+    }
+    // Prune expired notification keys so a fresh exhaustion re-notifies.
+    for (const [key, blockedUntil] of probeBlocks) {
+      if (blockedUntil <= now) probeBlocks.delete(key)
+    }
+    if (probedCount === 0) return undefined
+    return until === undefined
+      ? undefined
+      : { until, allLimited: limitedCount === probedCount }
+  }
+
+  // Slow cadence poll so exhausted accounts are held out of selection before
+  // the next request pays for the attempt.
+  const probeTimer = setInterval(() => {
+    for (const providerId of new Set([...managedIntegrations.keys(), ...externalIntegrations.keys()])) {
+      if (providerUsageProbe(providerId) === undefined) continue
+      void probeAccountsUsage(providerId, false).catch(() => undefined)
+    }
+  }, 60_000)
+  probeTimer.unref?.()
+
   const flagProviderQuotaBlock = async (providerId: string, failure: ProviderAttemptFailure): Promise<void> => {
     if ((quotaBlocks.get(providerId)?.until ?? 0) > Date.now()) return
+    // Prefer the provider's own usage probe when one exists: it names the
+    // exhausted accounts exactly and blocks them until the reported reset.
+    const probed = await probeAccountsUsage(providerId, true).catch(() => undefined)
+    if (probed !== undefined) {
+      if (probed.allLimited) {
+        const reason = failure.message.slice(0, 300)
+        quotaBlocks.set(providerId, { until: probed.until, reason })
+        try {
+          await store.blockProvider(providerId, probed.until, reason)
+          currentContext?.ui.notify(
+            `multiprovider: provider "${providerId}" is quota-blocked until ${new Date(probed.until).toLocaleString()} (usage probe)`,
+            'warning',
+          )
+        } catch {
+          // Persistence is best-effort; the in-memory block still applies.
+        }
+      }
+      return
+    }
     const policy = providerBilling.get(providerId)
     const until = policy === undefined
       ? Date.now() + SCHEDULER_DEFAULTS.quotaCooldownMs

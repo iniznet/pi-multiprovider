@@ -27,6 +27,18 @@ export {
   normalizeProviderQuotaEntry,
 } from './quota.ts'
 export {
+  bearerTokenFromAuth,
+  createHttpUsageProbe,
+  detectUsageUrl,
+  USAGE_WINDOW_FALLBACK_MS,
+  parseResetsAt,
+  parseUsagePayload,
+  UsageProbeCache,
+  type AccountUsageSnapshot,
+  type UsageProbe,
+  type UsageWindow,
+} from './usage-probe.ts'
+export {
   resolveVirtualThinkingMap,
   supportedThinkingLevels,
   VIRTUAL_DEFAULT_LEVEL_ORDER,
