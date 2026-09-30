@@ -664,7 +664,7 @@ describe('virtual providers', () => {
     expect(resolution).toMatchObject({ auth: { apiKey: 'virtual-provider' }, source: 'virtual provider' })
   })
 
-  it('advertises the thinking-level intersection across enabled backends', () => {
+  it('advertises the union of thinking levels across enabled backends', () => {
     const reasoningA: Model<'test-api'> = {
       ...modelA,
       reasoning: true,
@@ -695,13 +695,16 @@ describe('virtual providers', () => {
       getAffinityKey: () => 'session-1',
       resolveAmbientAuth: async () => ({ ok: true }),
     })
-    // Intersection of {low, high, max} and {low, medium, high}: low + high.
+    // Union of {low, high, max} and {minimal, low, medium, high}: every level
+    // the pool can serve somewhere stays selectable ('off' is nulled on both,
+    // 'xhigh' is never mapped, so neither is advertised).
     expect(virtual.getModels()[0]!.thinkingLevelMap).toEqual({
       off: null,
-      minimal: null,
+      minimal: 'minimal',
       low: 'low',
-      medium: null,
+      medium: 'medium',
       high: 'high',
+      max: 'max',
     })
   })
 
@@ -733,10 +736,12 @@ describe('virtual providers', () => {
       onBackendFatalMetadata: (providerId, modelId) => flagged.push(providerId + '/' + modelId),
     })
     const events = await collect(virtual.stream(virtual.getModels()[0]!, context, { reasoningEffort: 'high' }))
-    // prov-a/model-a cannot serve high: skipped without an HTTP attempt and
-    // flagged; prov-b/model-b (reasoning true, high supported) serves.
+    // prov-a/model-a cannot serve high: skipped without an HTTP attempt;
+    // prov-b/model-b (reasoning true, high supported) serves. The mismatch is
+    // request-scoped, so the pair must NOT be flagged permanently — a later
+    // request at 'medium' should still be able to use prov-a.
     expect(httpAttempts).toEqual(['prov-b/model-b'])
-    expect(flagged).toEqual(['prov-a/model-a'])
+    expect(flagged).toEqual([])
     expect(events.at(-1)).toMatchObject({ type: 'done' })
   })
 

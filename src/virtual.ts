@@ -295,8 +295,11 @@ function virtualStream<TApi extends Api>(
           }
 
           // The request's thinking level must be one the backing model can
-          // actually serve; the advertised virtual map is an intersection, but
-          // live metadata can diverge from the captured template.
+          // actually serve. The virtual map advertises the union of what the
+          // pool supports, so a level mismatch here is expected and
+          // request-scoped: skip this backend for this request only. It must
+          // NOT permanently flag the pair, or selecting 'high' once would
+          // evict the medium-only backends from the pool for good.
           const requestedLevel = typeof requestOptions.reasoningEffort === 'string'
             && requestOptions.reasoningEffort !== 'off'
             ? requestOptions.reasoningEffort as ModelThinkingLevel
@@ -308,7 +311,6 @@ function virtualStream<TApi extends Api>(
                 + '" does not support thinking level "' + requestedLevel + '"',
               outputStarted: false,
             }
-            dependencies.onBackendFatalMetadata?.(backend.providerId, backend.modelId, failure)
             lastSetupError = new Error(failure.message)
             const disposition = releaseFailure(failure)
             settled = true
