@@ -43,6 +43,19 @@ export interface ProviderAccount<TCredentialRef = unknown> {
   enabled?: boolean
   weight?: number
   priority?: number
+  /**
+   * Stage-one bucket key for two-level selection. Backends that live on the
+   * same backing provider share a group, so a provider-level strategy can
+   * spread load across providers before a model-level strategy chooses which
+   * model on the chosen provider serves the request.
+   */
+  group?: string
+  /**
+   * Soft cap on simultaneous leases. Selection prefers accounts below the cap
+   * and falls back to the least loaded account once every eligible account is
+   * at it, so a cap steers concurrency rather than refusing requests.
+   */
+  maxConcurrent?: number
   metadata?: Readonly<Record<string, string | number | boolean | null>>
 }
 
@@ -69,11 +82,18 @@ export interface AccountPreference {
   enabled: boolean
   weight: number
   priority: number
+  maxConcurrent?: number
 }
 
 export interface PoolPreference {
   providerId: string
   policy: SelectionPolicy
+  /**
+   * Provider-level strategy for two-level selection. Absent means one flat
+   * pass over the pool with `policy`, which is how every pool predating group
+   * selection behaves.
+   */
+  groupPolicy?: SelectionPolicy
   affinity: boolean
   accounts: AccountPreference[]
 }
@@ -156,6 +176,8 @@ export interface PublicAccountSnapshot {
   priority: number
   status: PublicAccountStatus
   inFlight: number
+  group?: string
+  maxConcurrent?: number
   consecutiveFailures: number
   cooldownUntil?: number
   lastSelectedAt?: number
@@ -167,6 +189,7 @@ export interface PublicPoolSnapshot {
   id: string
   label: string
   policy: SelectionPolicy
+  groupPolicy?: SelectionPolicy
   affinity: boolean
   firstAccountBias: boolean
   managementHint?: string

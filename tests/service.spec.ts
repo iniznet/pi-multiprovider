@@ -5,6 +5,7 @@ import {
   type ProviderAccount,
   type ProviderAttemptFailure,
   SCHEDULER_DEFAULTS,
+  type SelectionPolicy,
   UnknownAccountError,
 } from '../src/index.ts'
 
@@ -343,5 +344,209 @@ describe('MultiProviderService', () => {
     expect(service.getAffinity('example', 'session-1')).toEqual({ accountId: 'a', explicit: false })
     service.clearAffinity()
     expect(service.getAffinity('example', 'session-1')).toBeUndefined()
+  })
+})
+
+interface GroupedBackend {
+  id: string
+  group: string
+  weight?: number
+  priority?: number
+  maxConcurrent?: number
+}
+
+// Two providers, each exposing two of the same virtual model: the shape a
+// /vprovider pool has when a backing provider caps concurrency per model.
+const VIRTUAL_BACKENDS: GroupedBackend[] = [
+  { id: 'p1::m1', group: 'p1' },
+  { id: 'p1::m2', group: 'p1' },
+  { id: 'p2::m1', group: 'p2' },
+  { id: 'p2::m2', group: 'p2' },
+]
+
+async function groupedService(
+  options: {
+    backends?: GroupedBackend[]
+    providerStrategy?: SelectionPolicy | null
+    modelStrategy?: SelectionPolicy
+  } = {},
+): Promise<MultiProviderService> {
+  const service = new MultiProviderService({ randomInt: () => 0 })
+  service.registerProvider({
+    id: 'virtual',
+    label: 'Virtual',
+    selectionBias: 'none',
+    accounts: () => (options.backends ?? VIRTUAL_BACKENDS).map(backend => ({
+      id: backend.id,
+      label: backend.id,
+      authKind: 'custom' as const,
+      credentialRef: backend.id,
+      group: backend.group,
+      ...(backend.weight === undefined ? {} : { weight: backend.weight }),
+      ...(backend.priority === undefined ? {} : { priority: backend.priority }),
+      ...(backend.maxConcurrent === undefined ? {} : { maxConcurrent: backend.maxConcurrent }),
+    })),
+  })
+  await service.updatePool('virtual', {
+    affinity: false,
+    policy: options.modelStrategy ?? 'round-robin',
+    groupPolicy: options.providerStrategy === undefined ? 'round-robin' : options.providerStrategy,
+  })
+  return service
+}
+
+async function held(service: MultiProviderService, key?: string) {
+  return service.acquire<string>({
+    providerId: 'virtual',
+    ...(key === undefined ? {} : { affinityKey: key }),
+  })
+}
+
+async function picks(service: MultiProviderService, count: number): Promise<string[]> {
+  const seen: string[] = []
+  for (let index = 0; index < count; index += 1) {
+    const lease = await held(service)
+    seen.push(lease.accountId)
+    lease.release({ status: 'success' })
+  }
+  return seen
+}
+
+describe('two-level selection', () => {
+  it('rotates providers and models independently', async () => {
+    const service = await groupedService()
+    expect(await picks(service, 4)).toEqual(['p1::m1', 'p2::m1', 'p1::m2', 'p2::m2'])
+    const pool = (await service.snapshot()).providers[0]!
+    expect(pool.groupPolicy).toBe('round-robin')
+    expect(pool.accounts.map(account => account.group)).toEqual(['p1', 'p1', 'p2', 'p2'])
+  })
+
+  it('stays on one flat pass until a provider strategy is chosen', async () => {
+    const service = await groupedService({ providerStrategy: null })
+    // Flat round robin walks inventory order, so one provider serves twice in a
+    // row; the grouped path never repeats a provider before the other is used.
+    expect(await picks(service, 4)).toEqual(['p1::m1', 'p1::m2', 'p2::m1', 'p2::m2'])
+    expect((await service.snapshot()).providers[0]!.groupPolicy).toBeUndefined()
+  })
+
+  it('skips a provider whose models are all at their soft cap', async () => {
+    const service = await groupedService({
+      providerStrategy: 'priority',
+      modelStrategy: 'priority',
+      backends: [
+        { id: 'p1::m1', group: 'p1', maxConcurrent: 1, priority: 0 },
+        { id: 'p1::m2', group: 'p1', maxConcurrent: 1, priority: 0 },
+        { id: 'p2::m1', group: 'p2', priority: 1 },
+        { id: 'p2::m2', group: 'p2', priority: 1 },
+      ],
+    })
+    // p1 is the preferred provider, so it fills model by model first.
+    const first = await held(service)
+    const second = await held(service)
+    expect([first.accountId, second.accountId]).toEqual(['p1::m1', 'p1::m2'])
+    // Every model on p1 is at its cap, so the provider as a whole is skipped
+    // while the lower-priority provider still has headroom.
+    const third = await held(service)
+    expect(third.accountId.startsWith('p2::')).toBe(true)
+    // Freeing one model brings the preferred provider back.
+    first.release({ status: 'success' })
+    const fourth = await held(service)
+    expect(fourth.accountId).toBe('p1::m1')
+    for (const lease of [second, third, fourth]) lease.release({ status: 'success' })
+  })
+
+  it('serves the least loaded backend when every cap is reached', async () => {
+    const service = await groupedService({
+      backends: VIRTUAL_BACKENDS.map(backend => ({ ...backend, maxConcurrent: 1 })),
+    })
+    const leases = []
+    for (let index = 0; index < 4; index += 1) leases.push(await held(service))
+    // Fan-out past the cap degrades to the least loaded backend instead of
+    // refusing the request outright.
+    const overflow = await held(service)
+    expect(VIRTUAL_BACKENDS.some(backend => backend.id === overflow.accountId)).toBe(true)
+    const loaded = (await service.snapshot()).providers[0]!
+      .accounts.find(account => account.id === overflow.accountId)!
+    expect(loaded.inFlight).toBe(2)
+    expect(loaded.maxConcurrent).toBe(1)
+    for (const lease of [overflow, ...leases]) lease.release({ status: 'success' })
+  })
+
+  it('honors an explicit pin on a backend that is at its cap', async () => {
+    const service = await groupedService({
+      backends: VIRTUAL_BACKENDS.map(backend => ({ ...backend, maxConcurrent: 1 })),
+    })
+    await service.pinAccount('virtual', 'session-1', 'p1::m1')
+    await service.pinAccount('virtual', 'session-2', 'p1::m1')
+    const occupying = await held(service, 'session-2')
+    expect(occupying.accountId).toBe('p1::m1')
+    // A cap steers automatic placement; a switch the operator made stays put.
+    const pinned = await held(service, 'session-1')
+    expect(pinned.accountId).toBe('p1::m1')
+    pinned.release({ status: 'success' })
+    occupying.release({ status: 'success' })
+  })
+
+  it('weights a provider by the sum of its backend weights', async () => {
+    const service = await groupedService({
+      backends: [
+        { id: 'p1::m1', group: 'p1' },
+        { id: 'p1::m2', group: 'p1' },
+        { id: 'p1::m3', group: 'p1' },
+        { id: 'p2::m1', group: 'p2' },
+      ],
+      providerStrategy: 'weighted-round-robin',
+    })
+    const seen = await picks(service, 4)
+    expect(seen.filter(id => id.startsWith('p1::'))).toHaveLength(3)
+    expect(seen.filter(id => id.startsWith('p2::'))).toHaveLength(1)
+  })
+
+  it('spreads by least inflight across providers under a provider strategy', async () => {
+    const service = await groupedService({ providerStrategy: 'least-inflight' })
+    const first = await held(service)
+    const second = await held(service)
+    expect(second.accountId.split('::')[0]).not.toBe(first.accountId.split('::')[0])
+    first.release({ status: 'success' })
+    second.release({ status: 'success' })
+  })
+
+  it('lets a stored account preference override the backend cap', async () => {
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    service.registerProvider({
+      id: 'example',
+      label: 'Example',
+      accounts: () => [
+        { id: 'a', label: 'A', authKind: 'api-key', credentialRef: 'a', maxConcurrent: 4 },
+        { id: 'b', label: 'B', authKind: 'api-key', credentialRef: 'b' },
+      ],
+    })
+    await service.updatePool('example', {
+      affinity: false,
+      accounts: [
+        { accountId: 'a', enabled: true, weight: 1, priority: 0, maxConcurrent: 1 },
+        { accountId: 'b', enabled: true, weight: 1, priority: 0 },
+      ],
+    })
+    // a is capped at 1 by preference, so the second pick must spill to b.
+    const first = await service.acquire({ providerId: 'example' })
+    expect(first.accountId).toBe('a')
+    first.release({ status: 'success' })
+    const again = await service.acquire({ providerId: 'example' })
+    expect(again.accountId).toBe('a')
+    const overflow = await service.acquire({ providerId: 'example' })
+    expect(overflow.accountId).toBe('b')
+    again.release({ status: 'success' })
+    overflow.release({ status: 'success' })
+    expect((await service.snapshot()).providers[0]!.accounts[0]!.maxConcurrent).toBe(1)
+  })
+
+  it('treats a cap below one as uncapped instead of benching the account', async () => {
+    const service = await groupedService({
+      backends: [{ id: 'p1::m1', group: 'p1', maxConcurrent: 0 }, { id: 'p2::m1', group: 'p2' }],
+    })
+    const pool = (await service.snapshot()).providers[0]!
+    expect(pool.accounts[0]!.maxConcurrent).toBeUndefined()
+    expect(await picks(service, 3)).toEqual(['p1::m1', 'p2::m1', 'p1::m1'])
   })
 })

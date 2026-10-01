@@ -36,7 +36,47 @@ interface EffectiveAccount {
   enabled: boolean
   weight: number
   priority: number
+  group: string | undefined
+  maxConcurrent: number | undefined
   runtime: RuntimeState
+}
+
+// Provider-level view of a pool's grouped accounts, aggregated from the members
+// that are actually available so both stages of selection see one consistent
+// picture of a group's load and order.
+interface GroupAggregate {
+  key: string
+  weight: number
+  priority: number
+  inFlight: number
+  lastSelectedAt: number
+}
+
+// Model-level rotation state is namespaced per group once two-level selection
+// engages, so each provider keeps its own cursor instead of inheriting one
+// shared sequence that would pair a provider with the same model every time.
+// NUL cannot appear in a pool id, so namespaced keys cannot alias a real pool.
+const ROTATION_SEPARATOR = '\u0000'
+
+function rotationKey(providerId: string, groupKey: string): string {
+  return `${providerId}${ROTATION_SEPARATOR}group:${groupKey}`
+}
+
+function isPoolKey(key: string, providerId: string): boolean {
+  return key === providerId || key.startsWith(providerId + ROTATION_SEPARATOR)
+}
+
+function normalizeGroup(value: string | undefined): string | undefined {
+  const group = value?.trim()
+  return group === undefined || group === '' ? undefined : group
+}
+
+// A cap below 1 would make an account permanently unservable; treating it as
+// uncapped keeps a malformed config from silently benching a backend.
+function normalizeCap(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const cap = Math.floor(value)
+  return cap >= 1 ? cap : undefined
 }
 
 // Plain round-robin prefers the first healthy account in pool order by
@@ -103,6 +143,8 @@ export class MultiProviderService {
   private readonly explicitAffinity = new Map<string, Set<string>>()
   private readonly roundRobinCursor = new Map<string, number>()
   private readonly smoothScores = new Map<string, Map<string, number>>()
+  private readonly groupCursor = new Map<string, number>()
+  private readonly groupScores = new Map<string, Map<string, number>>()
   private readonly defaults: Required<Omit<SchedulerOptions, 'now' | 'randomId' | 'randomInt'>>
   private readonly now: () => number
   private readonly randomId: () => string
@@ -137,8 +179,16 @@ export class MultiProviderService {
       this.selectionBias.delete(registration.id)
       this.affinity.delete(registration.id)
       this.explicitAffinity.delete(registration.id)
-      this.roundRobinCursor.delete(registration.id)
-      this.smoothScores.delete(registration.id)
+      // Group-scoped model cursors and scores outlive the bare pool id, so an
+      // unregister sweeps those entries too.
+      for (const key of [...this.roundRobinCursor.keys()]) {
+        if (isPoolKey(key, registration.id)) this.roundRobinCursor.delete(key)
+      }
+      for (const key of [...this.smoothScores.keys()]) {
+        if (isPoolKey(key, registration.id)) this.smoothScores.delete(key)
+      }
+      this.groupCursor.delete(registration.id)
+      this.groupScores.delete(registration.id)
     }
   }
 
@@ -193,7 +243,7 @@ export class MultiProviderService {
         selected = available.find(item => item.account.id === pinnedId)
       }
     }
-    selected ??= this.select(options.providerId, pool.policy, available)
+    selected ??= this.select(options.providerId, pool.policy, pool.groupPolicy, available)
 
     if (options.affinityKey !== undefined && pool.affinity && !explicitPin) {
       let table = this.affinity.get(options.providerId)
@@ -236,7 +286,7 @@ export class MultiProviderService {
       const effective = await this.effectiveAccounts(registration, pool)
       const now = this.now()
       const accounts: PublicAccountSnapshot[] = effective.map(({
-        account, enabled, weight, priority, runtime,
+        account, enabled, weight, priority, group, maxConcurrent, runtime,
       }) => ({
         id: account.id,
         label: account.label,
@@ -244,6 +294,8 @@ export class MultiProviderService {
         enabled,
         weight,
         priority,
+        ...(group === undefined ? {} : { group }),
+        ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
         status: !enabled ? 'disabled' : runtime.cooldownUntil > now ? 'cooldown' : 'ready',
         inFlight: runtime.inFlight,
         consecutiveFailures: runtime.consecutiveFailures,
@@ -256,6 +308,7 @@ export class MultiProviderService {
         id: registration.id,
         label: registration.label,
         policy: pool.policy,
+        ...(pool.groupPolicy === undefined ? {} : { groupPolicy: pool.groupPolicy }),
         affinity: pool.affinity,
         firstAccountBias: (this.selectionBias.get(registration.id) ?? DEFAULT_SELECTION_BIAS) === 'first-account',
         ...(registration.managementHint === undefined
@@ -269,13 +322,20 @@ export class MultiProviderService {
 
   async updatePool(
     providerId: string,
-    patch: Partial<Pick<PoolPreference, 'policy' | 'affinity' | 'accounts'>>,
+    patch: Partial<Pick<PoolPreference, 'policy' | 'affinity' | 'accounts'>>
+      & { groupPolicy?: SelectionPolicy | null },
   ): Promise<PublicPoolSnapshot> {
     this.registration(providerId)
     const current = this.pool(providerId)
+    // `null` clears the provider-level strategy and returns the pool to one
+    // flat pass; `undefined` leaves it untouched.
+    const groupPolicy = patch.groupPolicy === null
+      ? undefined
+      : patch.groupPolicy ?? current.groupPolicy
     const next: PoolPreference = {
       providerId,
       policy: patch.policy ?? current.policy,
+      ...(groupPolicy === undefined ? {} : { groupPolicy }),
       affinity: patch.affinity ?? current.affinity,
       accounts: (patch.accounts ?? current.accounts).map(account => ({ ...account })),
     }
@@ -445,6 +505,8 @@ export class MultiProviderService {
         enabled: account.enabled !== false && (preference?.enabled ?? true),
         weight: preference?.weight ?? account.weight ?? 1,
         priority: preference?.priority ?? account.priority ?? 0,
+        group: normalizeGroup(account.group),
+        maxConcurrent: normalizeCap(preference?.maxConcurrent ?? account.maxConcurrent),
         runtime: this.runtimeFor(registration.id, account.id),
       }
     })
@@ -452,6 +514,149 @@ export class MultiProviderService {
 
   private select(
     providerId: string,
+    policy: SelectionPolicy,
+    groupPolicy: SelectionPolicy | undefined,
+    accounts: EffectiveAccount[],
+  ): EffectiveAccount {
+    // Two-level selection engages only when the operator chose a
+    // provider-level strategy and the pool actually has groups; otherwise the
+    // pool keeps its single flat pass over accounts.
+    if (groupPolicy !== undefined && accounts.some(item => item.group !== undefined)) {
+      return this.selectGrouped(providerId, policy, groupPolicy, accounts)
+    }
+    return this.selectBy(providerId, providerId, policy, this.preferHeadroom(accounts))
+  }
+
+  // Accounts still below their soft cap, or the least loaded account when every
+  // eligible one is at it. A cap therefore biases placement instead of turning
+  // a busy pool into a hard failure for fan-out callers.
+  private preferHeadroom(items: EffectiveAccount[]): EffectiveAccount[] {
+    if (!items.some(item => item.maxConcurrent !== undefined)) return items
+    const free = items.filter(item => !this.isCapped(item))
+    return free.length > 0 ? free : [this.leastLoaded(items)]
+  }
+
+  private isCapped(item: EffectiveAccount): boolean {
+    return item.maxConcurrent !== undefined && item.runtime.inFlight >= item.maxConcurrent
+  }
+
+  private leastLoaded(items: EffectiveAccount[]): EffectiveAccount {
+    return [...items].sort((left, right) =>
+      left.runtime.inFlight - right.runtime.inFlight
+      || (left.runtime.lastSelectedAt ?? 0) - (right.runtime.lastSelectedAt ?? 0),
+    )[0]!
+  }
+
+  private selectGrouped(
+    providerId: string,
+    modelPolicy: SelectionPolicy,
+    groupPolicy: SelectionPolicy,
+    accounts: EffectiveAccount[],
+  ): EffectiveAccount {
+    // Bucket order is first-appearance order, so both stages follow pool
+    // (inventory) order the same way the flat path does.
+    const buckets = new Map<string, EffectiveAccount[]>()
+    for (const item of accounts) {
+      const key = item.group ?? `account:${item.account.id}`
+      const members = buckets.get(key)
+      if (members === undefined) buckets.set(key, [item])
+      else members.push(item)
+    }
+    // A group is selectable only while at least one of its models has headroom.
+    const live = new Map<string, EffectiveAccount[]>()
+    for (const [key, members] of buckets) {
+      const free = members.filter(item => !this.isCapped(item))
+      if (free.length > 0) live.set(key, free)
+    }
+    if (live.size === 0) {
+      return this.selectBy(providerId, providerId, modelPolicy, [this.leastLoaded(accounts)])
+    }
+    const chosen = this.selectGroup(providerId, groupPolicy, buckets, live)
+    return this.selectBy(providerId, rotationKey(providerId, chosen), modelPolicy, live.get(chosen)!)
+  }
+
+  private selectGroup(
+    providerId: string,
+    groupPolicy: SelectionPolicy,
+    buckets: Map<string, EffectiveAccount[]>,
+    live: Map<string, EffectiveAccount[]>,
+  ): string {
+    const candidates = this.groupAggregates(buckets).filter(group => live.has(group.key))
+    if (groupPolicy === 'least-inflight') {
+      return [...candidates].sort((left, right) =>
+        left.inFlight - right.inFlight
+        || left.lastSelectedAt - right.lastSelectedAt,
+      )[0]!.key
+    }
+    if (groupPolicy === 'priority') {
+      return [...candidates].sort((left, right) =>
+        left.priority - right.priority
+        || left.inFlight - right.inFlight
+        || left.lastSelectedAt - right.lastSelectedAt,
+      )[0]!.key
+    }
+    if (groupPolicy === 'weighted-round-robin') {
+      return this.selectGroupWeighted(providerId, candidates)
+    }
+    // Plain round-robin: the pool's tie-break bias applies across providers too,
+    // so a first-account pool keeps using its primary provider until that
+    // provider runs out of headroom.
+    if ((this.selectionBias.get(providerId) ?? DEFAULT_SELECTION_BIAS) === 'first-account') {
+      return candidates[0]!.key
+    }
+    let cursor = this.groupCursor.get(providerId)
+    if (cursor === undefined) {
+      cursor = candidates.length > 1 ? this.randomInt(candidates.length) : 0
+      this.groupCursor.set(providerId, cursor)
+    }
+    const chosen = candidates[cursor % candidates.length]!
+    this.groupCursor.set(providerId, (cursor + 1) % candidates.length)
+    return chosen.key
+  }
+
+  private selectGroupWeighted(providerId: string, candidates: GroupAggregate[]): string {
+    let scores = this.groupScores.get(providerId)
+    if (scores === undefined) {
+      scores = new Map()
+      this.groupScores.set(providerId, scores)
+    }
+    const live = new Set(candidates.map(group => group.key))
+    for (const key of scores.keys()) if (!live.has(key)) scores.delete(key)
+    const total = candidates.reduce((sum, group) => sum + group.weight, 0)
+    let chosen = candidates[0]!
+    let best = Number.NEGATIVE_INFINITY
+    for (const group of candidates) {
+      const score = (scores.get(group.key) ?? 0) + group.weight
+      scores.set(group.key, score)
+      if (score > best) {
+        best = score
+        chosen = group
+      }
+    }
+    scores.set(chosen.key, (scores.get(chosen.key) ?? 0) - total)
+    return chosen.key
+  }
+
+  // Group weight is the sum of member weights, so a provider holding three
+  // backends carries three times the share of an equal-weight single backend.
+  // Priority is the best (lowest) member priority: a provider qualifies for a
+  // priority tier as soon as any of its models sits in it.
+  private groupAggregates(buckets: Map<string, EffectiveAccount[]>): GroupAggregate[] {
+    return [...buckets].map(([key, members]) => ({
+      key,
+      weight: members.reduce((sum, item) => sum + Math.max(1, item.weight), 0),
+      priority: Math.min(...members.map(item => item.priority)),
+      inFlight: members.reduce((sum, item) => sum + item.runtime.inFlight, 0),
+      lastSelectedAt: Math.max(...members.map(item => item.runtime.lastSelectedAt ?? 0)),
+    }))
+  }
+
+  // `providerId` owns pool-wide settings such as the tie-break bias; `rotation`
+  // namespaces per-model cursors once selection is grouped, so each provider
+  // advances through its own models instead of inheriting one shared sequence.
+  private selectBy(
+    providerId: string,
+    rotation: string,
     policy: SelectionPolicy,
     accounts: EffectiveAccount[],
   ): EffectiveAccount {
@@ -471,7 +676,7 @@ export class MultiProviderService {
       )[0]!
     }
     if (policy === 'weighted-round-robin') {
-      return this.selectWeighted(providerId, accounts)
+      return this.selectWeighted(rotation, accounts)
     }
     // Plain round-robin. accounts preserves pool (inventory) order, so the
     // first entry is the operator's main account; bias keeps new sessions on
@@ -482,17 +687,17 @@ export class MultiProviderService {
     // Differing weights rotate traffic shares even under this policy; equal
     // (or unset) weights keep the classic even rotation.
     if (accounts.some(item => item.weight !== accounts[0]!.weight)) {
-      return this.selectWeighted(providerId, accounts)
+      return this.selectWeighted(rotation, accounts)
     }
     // The rotation cursor starts at a random offset so a fresh process does
     // not always land its first session on the same backend.
-    let cursor = this.roundRobinCursor.get(providerId)
+    let cursor = this.roundRobinCursor.get(rotation)
     if (cursor === undefined) {
       cursor = accounts.length > 1 ? this.randomInt(accounts.length) : 0
-      this.roundRobinCursor.set(providerId, cursor)
+      this.roundRobinCursor.set(rotation, cursor)
     }
     const selected = accounts[cursor % accounts.length]!
-    this.roundRobinCursor.set(providerId, (cursor + 1) % accounts.length)
+    this.roundRobinCursor.set(rotation, (cursor + 1) % accounts.length)
     return selected
   }
 
