@@ -159,7 +159,43 @@ A backing provider limits concurrency **per model**, and one virtual pool routin
 | **Provider strategy** | which backing provider serves the request | `off (one flat pass)` — one strategy chooses among all backends, exactly as pools behaved before |
 | **Model strategy** | which model on that provider serves it | always active; when the provider strategy is off it governs the whole pool (`· all backends`) |
 
-Both accept the same four strategies. A provider is scored as the **sum** of its backends' weights, carries the **best** (lowest) priority among them, and its in-flight count is the sum across its backends — so a provider holding three backends takes three times the share of an equal-weight single backend under weighted round robin, and qualifies for a priority tier as soon as one of its models sits in it.
+Both accept the same four strategies. A provider is scored as the **sum** of its backends' weights, and its in-flight count is the sum across its backends — so a provider holding three backends takes three times the share of an equal-weight single backend under weighted round robin.
+
+### Ordering: which provider runs first
+
+Choosing **Priority** as the provider strategy means *primary, then backup, then last resort*. What decides the order is **not** the backend list — it is the provider's rank:
+
+```
+rank = providerPriority[provider]      ← set by the ordering page
+     ?? min(priority of its backends)  ← derived, the fallback
+```
+
+The derived rule has a sharp edge worth knowing: every backend defaults to priority `0`, so a fresh pool gives **every provider rank 0**. They are all tied, all primary, and priority falls through to the tie-break — least in-flight, then least recently used. That is load sharing, not failover, and it looks like "the strategy isn't working" when it is simply unordered. `providers (priority order)` exists to remove that ambiguity:
+
+```
+Providers (priority order)
+  1. opencode-go · rank 0 · 1 model
+  2. commandcode · rank 1 · 4 models
+  3. hypercharm · rank 2 · 2 models
+```
+
+Enter a provider to **Move up**, **Move down**, **Move to front**, or **Set rank**. The first move materializes every provider's rank as a sequential number, so an ambiguous derived order becomes an explicit one you can read off the list. Ties you create deliberately (two providers at rank `0`) still load-share instead of secretly preferring whichever was listed first.
+
+**Clear explicit ranks (rank by backends again)** removes `providerPriority` entirely and returns the pool to deriving each provider's rank from its best backend — the row only appears while explicit ranks exist, and the page header always says which of the two modes you are in.
+
+A tier hands over when it genuinely cannot serve, and comes back on its own:
+
+| Tier becomes unavailable when | How long |
+| --- | --- |
+| 429 / rate limit | `rateLimitCooldownMs` (60s default) |
+| 402 / quota / out of credit | `quotaCooldownMs`, or the provider's billing reset when marked, and every model on it is skipped **before** any HTTP attempt |
+| 401 / 403 / revoked token | `authCooldownMs` (5m) |
+| 5xx / timeout / network | exponential backoff from `transientBaseCooldownMs`, capped at `maxCooldownMs` |
+| you disable its backends | until you re-enable them |
+
+Recovering the first tier returns traffic to it automatically — there is nothing to un-pin.
+
+**Ordering models inside a provider** works the same way, on the existing backend page: **Move up / Move down / Move to front** rewrite backend priorities (shown as `Order position: 2 of 7`, and as `· p1` on the row), which is what **Model strategy: priority** reads. Ranking the whole list keeps each provider's internal order intact, because models are only compared inside the provider already chosen. When the model strategy is not `priority`, those numbers do not decide anything — least-inflight, round robin and weighted round robin ignore them.
 
 **Concurrency caps.** Each backend takes a `Max concurrent requests` value (`0` or blank clears it). Selection prefers backends below their cap, and a provider drops out of stage one entirely only when *every* one of its models is at the cap. A backend with no cap shows no load column, because a bare count has nothing to be measured against:
 

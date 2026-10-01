@@ -79,6 +79,21 @@ function normalizeCap(value: number | undefined): number | undefined {
   return cap >= 1 ? cap : undefined
 }
 
+// Provider ranks accept 0 (the first tier), unlike caps where below one means
+// uncapped. Garbage entries are dropped rather than thrown so a hand-edited
+// config degrades to the derived ordering instead of refusing to load.
+function normalizeGroupPriorities(
+  value: Record<string, number> | undefined,
+): Record<string, number> | undefined {
+  if (value === undefined) return undefined
+  const ranks: Record<string, number> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (key.trim() === '' || entry === undefined || !Number.isFinite(entry)) continue
+    ranks[key] = Math.max(0, Math.floor(entry))
+  }
+  return Object.keys(ranks).length === 0 ? undefined : ranks
+}
+
 // Same rule per group ceiling, with empty maps collapsed to absent so a pool
 // that never set a limit reads identically to one that cleared it later.
 function normalizeGroupLimits(
@@ -257,13 +272,7 @@ export class MultiProviderService {
         selected = available.find(item => item.account.id === pinnedId)
       }
     }
-    selected ??= this.select(
-      options.providerId,
-      pool.policy,
-      pool.groupPolicy,
-      pool.groupLimits,
-      available,
-    )
+    selected ??= this.select(pool, available)
 
     if (options.affinityKey !== undefined && pool.affinity && !explicitPin) {
       let table = this.affinity.get(options.providerId)
@@ -341,27 +350,43 @@ export class MultiProviderService {
     return { providers }
   }
 
+  // A patch entry of null clears a setting, undefined leaves it as configured,
+  // and a value replaces it. Three pool settings need exactly this, so the rule
+  // is stated once instead of a ternary per field.
+  private patched<T>(
+    value: T | null | undefined,
+    current: T | undefined,
+    normalize: (entry: T) => T | undefined = entry => entry,
+  ): T | undefined {
+    if (value === null) return undefined
+    if (value === undefined) return current
+    return normalize(value)
+  }
+
   async updatePool(
     providerId: string,
     patch: Partial<Pick<PoolPreference, 'policy' | 'affinity' | 'accounts'>>
-      & { groupPolicy?: SelectionPolicy | null, groupLimits?: Record<string, number> | null },
+      & { groupPolicy?: SelectionPolicy | null,
+        groupLimits?: Record<string, number> | null,
+        groupPriorities?: Record<string, number> | null },
   ): Promise<PublicPoolSnapshot> {
     this.registration(providerId)
     const current = this.pool(providerId)
     // `null` clears the provider-level strategy and returns the pool to one
     // flat pass; `undefined` leaves it untouched.
-    const groupPolicy = patch.groupPolicy === null
-      ? undefined
-      : patch.groupPolicy ?? current.groupPolicy
-    // null clears every ceiling; an omitted key leaves them as configured.
-    const groupLimits = patch.groupLimits === null
-      ? undefined
-      : normalizeGroupLimits(patch.groupLimits ?? current.groupLimits)
+    const groupPolicy = this.patched(patch.groupPolicy, current.groupPolicy)
+    const groupLimits = this.patched(patch.groupLimits, current.groupLimits, normalizeGroupLimits)
+    const groupPriorities = this.patched(
+      patch.groupPriorities,
+      current.groupPriorities,
+      normalizeGroupPriorities,
+    )
     const next: PoolPreference = {
       providerId,
       policy: patch.policy ?? current.policy,
       ...(groupPolicy === undefined ? {} : { groupPolicy }),
       ...(groupLimits === undefined ? {} : { groupLimits }),
+      ...(groupPriorities === undefined ? {} : { groupPriorities }),
       affinity: patch.affinity ?? current.affinity,
       accounts: (patch.accounts ?? current.accounts).map(account => ({ ...account })),
     }
@@ -538,22 +563,17 @@ export class MultiProviderService {
     })
   }
 
-  private select(
-    providerId: string,
-    policy: SelectionPolicy,
-    groupPolicy: SelectionPolicy | undefined,
-    groupLimits: Record<string, number> | undefined,
-    accounts: EffectiveAccount[],
-  ): EffectiveAccount {
+  private select(pool: PoolPreference, accounts: EffectiveAccount[]): EffectiveAccount {
+    const providerId = pool.providerId
     // Two-level selection engages only when the operator chose a
     // provider-level strategy and the pool actually has groups; otherwise the
     // pool keeps its single flat pass over accounts. Provider ceilings apply
     // either way, because they filter candidates rather than order them.
-    const withinCeiling = this.withGroupHeadroom(accounts, groupLimits)
-    if (groupPolicy !== undefined && accounts.some(item => item.group !== undefined)) {
-      return this.selectGrouped(providerId, policy, groupPolicy, groupLimits, withinCeiling)
+    const withinCeiling = this.withGroupHeadroom(accounts, pool.groupLimits)
+    if (pool.groupPolicy !== undefined && accounts.some(item => item.group !== undefined)) {
+      return this.selectGrouped(providerId, pool, withinCeiling)
     }
-    return this.selectBy(providerId, providerId, policy, this.preferHeadroom(withinCeiling))
+    return this.selectBy(providerId, providerId, pool.policy, this.preferHeadroom(withinCeiling))
   }
 
   // A provider-wide ceiling filters eligibility the same way a per-account cap
@@ -610,11 +630,10 @@ export class MultiProviderService {
 
   private selectGrouped(
     providerId: string,
-    modelPolicy: SelectionPolicy,
-    groupPolicy: SelectionPolicy,
-    groupLimits: Record<string, number> | undefined,
+    pool: PoolPreference,
     accounts: EffectiveAccount[],
   ): EffectiveAccount {
+    const modelPolicy = pool.policy
     // Bucket order is first-appearance order, so both stages follow pool
     // (inventory) order the same way the flat path does.
     const buckets = new Map<string, EffectiveAccount[]>()
@@ -626,8 +645,8 @@ export class MultiProviderService {
     // A group is selectable while it is under its provider ceiling and at least
     // one of its models still has headroom of its own.
     const live = new Map<string, EffectiveAccount[]>()
-    for (const group of this.groupAggregates(buckets)) {
-      const limit = groupLimits?.[group.key]
+    for (const group of this.groupAggregates(buckets, pool.groupPriorities)) {
+      const limit = pool.groupLimits?.[group.key]
       if (limit !== undefined && group.inFlight >= limit) continue
       const free = buckets.get(group.key)!.filter(item => !this.isCapped(item))
       if (free.length > 0) live.set(group.key, free)
@@ -635,17 +654,19 @@ export class MultiProviderService {
     if (live.size === 0) {
       return this.selectBy(providerId, providerId, modelPolicy, [this.leastLoaded(accounts)])
     }
-    const chosen = this.selectGroup(providerId, groupPolicy, buckets, live)
+    const chosen = this.selectGroup(providerId, pool, buckets, live)
     return this.selectBy(providerId, rotationKey(providerId, chosen), modelPolicy, live.get(chosen)!)
   }
 
   private selectGroup(
     providerId: string,
-    groupPolicy: SelectionPolicy,
+    pool: PoolPreference,
     buckets: Map<string, EffectiveAccount[]>,
     live: Map<string, EffectiveAccount[]>,
   ): string {
-    const candidates = this.groupAggregates(buckets).filter(group => live.has(group.key))
+    const groupPolicy = pool.groupPolicy ?? pool.policy
+    const candidates = this.groupAggregates(buckets, pool.groupPriorities)
+      .filter(group => live.has(group.key))
     if (groupPolicy === 'least-inflight') {
       return [...candidates].sort((left, right) =>
         left.inFlight - right.inFlight
@@ -705,11 +726,16 @@ export class MultiProviderService {
   // backends carries three times the share of an equal-weight single backend.
   // Priority is the best (lowest) member priority: a provider qualifies for a
   // priority tier as soon as any of its models sits in it.
-  private groupAggregates(buckets: Map<string, EffectiveAccount[]>): GroupAggregate[] {
+  private groupAggregates(
+    buckets: Map<string, EffectiveAccount[]>,
+    groupPriorities: Record<string, number> | undefined,
+  ): GroupAggregate[] {
     return [...buckets].map(([key, members]) => ({
       key,
       weight: members.reduce((sum, item) => sum + Math.max(1, item.weight), 0),
-      priority: Math.min(...members.map(item => item.priority)),
+      // An explicit rank wins over the minimum member priority, so ordering
+      // providers never depends on which backend happens to carry the number.
+      priority: groupPriorities?.[key] ?? Math.min(...members.map(item => item.priority)),
       inFlight: members.reduce((sum, item) => sum + item.runtime.inFlight, 0),
       lastSelectedAt: Math.max(...members.map(item => item.runtime.lastSelectedAt ?? 0)),
     }))

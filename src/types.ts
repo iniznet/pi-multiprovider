@@ -101,6 +101,13 @@ export interface PoolPreference {
    * per-process, so several pi processes on one pool each hold their own budget.
    */
   groupLimits?: Record<string, number>
+  /**
+   * Explicit provider ranks keyed by group, used by the priority strategy
+   * instead of the minimum member priority. Without it a provider inherits the
+   * best tier among its models, so adding one backend at the default priority
+   0 silently promotes that provider into the first tier.
+   */
+  groupPriorities?: Record<string, number>
   affinity: boolean
   accounts: AccountPreference[]
 }
@@ -300,6 +307,12 @@ export interface VirtualProviderConfig {
    * is what a provider with a per-model concurrency limit needs.
    */
   providerStrategy?: SelectionPolicy
+  /**
+   * Explicit provider ranks keyed by provider id, smaller running first. The
+   * /vprovider ordering list writes this; leave it absent to keep deriving each
+   * provider's rank from its best backend.
+   */
+  providerPriority?: Record<string, number>
   // Session stickiness across this pool's backends. Default true, matching
   // account pools. Turn it off when a fan-out host (subagents, workflows)
   // should spread across backends instead of reusing one per session.

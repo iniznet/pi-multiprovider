@@ -335,6 +335,7 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
   })
   const strategy = normalizeStrategy(candidate.strategy, candidate.id)
   const providerStrategy = normalizeStrategy(candidate.providerStrategy, candidate.id)
+  const providerPriority = normalizeProviderPriority(candidate.providerPriority, candidate.id)
   if (candidate.affinity !== undefined && typeof candidate.affinity !== 'boolean') {
     throw new Error(`multiprovider: malformed affinity for virtual provider "${candidate.id}"`)
   }
@@ -345,6 +346,7 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
     // Absent means one flat pass, so nothing is written until a provider-level
     // strategy is actually chosen.
     ...(providerStrategy === undefined ? {} : { providerStrategy }),
+    ...(providerPriority === undefined ? {} : { providerPriority }),
     // Affinity on is the default, so only an explicit opt-out is persisted.
     ...(candidate.affinity ? {} : candidate.affinity === false ? { affinity: false } : {}),
     models,
@@ -442,6 +444,31 @@ function normalizeConcurrency(value: number | undefined): number | undefined {
 
 function normalizeBackendPriority(value: number | undefined): number {
   return Number.isFinite(value) && (value ?? 0) >= 0 ? Math.floor(value!) : 0
+}
+
+// Explicit provider ranks keyed by provider id, smaller running first. Keys go
+// through the same id validator as backends, so a hand-edited config cannot
+// smuggle a prototype key into the rank map. Values must be whole numbers from
+// 0 up: a malformed rank is a config error, not a silent fallback.
+function normalizeProviderPriority(
+  value: unknown,
+  providerId: string,
+): Record<string, number> | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error(`multiprovider: malformed provider priority for virtual provider "${providerId}"`)
+  }
+  const ranks: Record<string, number> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    assertVirtualId(key, 'provider priority key')
+    if (typeof entry !== 'number' || !Number.isFinite(entry) || entry < 0) {
+      throw new Error(
+        `multiprovider: malformed provider priority "${key}" for virtual provider "${providerId}"`,
+      )
+    }
+    ranks[key] = Math.floor(entry)
+  }
+  return Object.keys(ranks).length === 0 ? undefined : ranks
 }
 
 function normalizeStrategy(value: unknown, providerId: string): SelectionPolicy | undefined {

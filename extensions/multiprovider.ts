@@ -146,8 +146,10 @@ type EditorPage =
   | { kind: 'provider-picker' }
   | { kind: 'model-picker' }
   | { kind: 'backend' }
+  | { kind: 'provider-order' }
+  | { kind: 'provider-rank' }
   | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'max-concurrent'
-      | 'provider-limit' | 'reset-hour' }
+      | 'provider-limit' | 'provider-rank' | 'reset-hour' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -187,6 +189,7 @@ class VirtualProviderEditorDialog extends Container {
   // Provider whose billing reset hour the input page is currently editing.
   private activeResetHourProvider: string | undefined
   private activeLimitProvider: string | undefined
+  private activeRankProvider: string | undefined
   private inputInitial = ''
   private pageError = ''
   private activeList: SettingsList | undefined
@@ -262,6 +265,8 @@ class VirtualProviderEditorDialog extends Container {
     else if (this.page.kind === 'provider-picker') this.buildProviderPicker()
     else if (this.page.kind === 'model-picker') this.buildModelPicker()
     else if (this.page.kind === 'backend') this.buildBackendActions()
+    else if (this.page.kind === 'provider-order') this.buildProviderOrder()
+    else if (this.page.kind === 'provider-rank') this.buildProviderRankActions()
     else this.buildInput()
   }
 
@@ -388,6 +393,7 @@ class VirtualProviderEditorDialog extends Container {
       this.menuItem('strategy', `Model strategy: ${strategy}`
         + (providerStrategy === undefined ? ' · all backends' : ' · within provider')),
       this.menuItem('affinity', `Session affinity: ${affinity ? 'on (sticky per session)' : 'off (rotate)'}`),
+      this.menuItem('provider-order', 'Providers (priority order)'),
       this.menuItem('add', 'Add backing provider model'),
       ...billingProviders.map(providerId => this.menuItem(
         'billing-' + providerId,
@@ -453,6 +459,8 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = model.id
           this.goTo({ kind: 'input', purpose: 'model-id' })
+        } else if (id === 'provider-order') {
+          this.goTo({ kind: 'provider-order' })
         } else if (id === 'provider-strategy') {
           const next = nextProviderStrategy(this.draft!.providerStrategy)
           if (next === 'off') delete this.draft!.providerStrategy
@@ -599,14 +607,161 @@ class VirtualProviderEditorDialog extends Container {
     )
   }
 
+  // Distinct providers of the model being edited, in the order a priority
+  // strategy will try them. An explicit rank wins over the best backend rank so
+  // ordering never depends on which backend happens to carry a number.
+  private orderedProviders(): string[] {
+    const model = this.draft!.models[0]!
+    const appearance = new Map<string, number>()
+    for (const backend of model.backends) {
+      if (!appearance.has(backend.providerId)) appearance.set(backend.providerId, appearance.size)
+    }
+    const rank = (providerId: string): number => this.draft!.providerPriority?.[providerId]
+      ?? Math.min(...model.backends.filter(backend => backend.providerId === providerId)
+        .map(backend => backend.priority ?? 0))
+    return [...appearance.keys()]
+      .sort((left, right) => rank(left) - rank(right) || appearance.get(left)! - appearance.get(right)!)
+  }
+
+  // Moving materializes the whole list as sequential ranks: before the first
+  // move a pool can hold deliberate ties that load-share, and rewriting every
+  // entry is how an ambiguous derived order becomes an explicit one.
+  private moveProvider(providerId: string, delta: -1 | 0 | 1): void {
+    const order = this.orderedProviders()
+    const from = order.indexOf(providerId)
+    if (from < 0 || order.length < 2) return
+    const to = delta === 0 ? 0 : Math.min(order.length - 1, Math.max(0, from + delta))
+    if (to === from) return
+    order.splice(from, 1)
+    order.splice(to, 0, providerId)
+    // Ranks for providers outside the model being edited are preserved: one
+    // virtual provider can hold several models over different providers.
+    const priorities: Record<string, number> = { ...(this.draft!.providerPriority ?? {}) }
+    order.forEach((id, position) => { priorities[id] = position })
+    this.draft!.providerPriority = priorities
+  }
+
+  // Same materialize-then-assign rule for models. Ranking the whole list keeps
+  // each provider's internal order intact, because selection compares models
+  // only inside the provider it already chose.
+  private moveBackend(delta: -1 | 0 | 1): void {
+    const backends = this.draft!.models[0]!.backends
+    if (backends.length < 2) return
+    const ranked = backends
+      .map((backend, position) => ({ backend, position }))
+      .sort((left, right) => (left.backend.priority ?? 0) - (right.backend.priority ?? 0)
+        || left.position - right.position)
+      .map(entry => entry.backend)
+    const from = ranked.indexOf(backends[this.activeBackendIndex]!)
+    if (from < 0) return
+    const to = delta === 0 ? 0 : Math.min(ranked.length - 1, Math.max(0, from + delta))
+    if (to === from) return
+    ranked.splice(from, 1)
+    ranked.splice(to, 0, backends[this.activeBackendIndex]!)
+    ranked.forEach((backend, position) => { backend.priority = position })
+    this.activeBackendIndex = to
+  }
+
+  private orderedBackendPosition(): number {
+    const backends = this.draft!.models[0]!.backends
+    const active = backends[this.activeBackendIndex]
+    if (active === undefined) return 0
+    const ranked = backends
+      .map((backend, position) => ({ backend, position }))
+      .sort((left, right) => (left.backend.priority ?? 0) - (right.backend.priority ?? 0)
+        || left.position - right.position)
+    return ranked.findIndex(entry => entry.backend === active) + 1
+  }
+
+  private buildProviderOrder(): void {
+    const order = this.orderedProviders()
+    const model = this.draft!.models[0]!
+    const explicit = this.draft!.providerPriority !== undefined
+    const items = [
+      ...order.map((providerId, position) => this.menuItem(
+        'provider-rank-' + providerId,
+        `${position + 1}. ${providerId}`
+          + ` · rank ${this.draft!.providerPriority?.[providerId] ?? position}`
+          + ` · ${model.backends.filter(backend => backend.providerId === providerId).length} model(s)`,
+      )),
+      ...(explicit
+        ? [this.menuItem('rank-derive', 'Clear explicit ranks (rank by backends again)')]
+        : []),
+    ]
+    // The header states which ranking mode is active, because a derived rank and
+    // an explicit one can show the same numbers while behaving differently.
+    const source = explicit
+      ? 'ranks are explicit'
+      : 'ranks are derived from the best backend of each provider'
+    this.attachList(
+      'Providers in priority order',
+      order.length < 2
+        ? `This pool has one provider, so there is nothing to order · ${source}.`
+        : `Enter opens a provider to move it · ${source}.`
+          + (explicit ? '' : ' Moving makes the order explicit for every provider.'),
+      items,
+      id => {
+        if (id === 'rank-derive') {
+          delete this.draft!.providerPriority
+          this.goTo({ kind: 'provider-order' })
+          return
+        }
+        this.activeRankProvider = id.slice('provider-rank-'.length)
+        this.goTo({ kind: 'provider-rank' })
+      },
+      () => this.goTo({ kind: 'menu' }),
+    )
+  }
+
+  private buildProviderRankActions(): void {
+    const providerId = this.activeRankProvider
+    if (providerId === undefined) {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const items: SettingItem[] = [
+      this.menuItem('rank-up', 'Move up (toward first)'),
+      this.menuItem('rank-down', 'Move down (toward last)'),
+      this.menuItem('rank-front', 'Move to front'),
+      this.menuItem('rank-set',
+        `Set rank (now ${this.draft!.providerPriority?.[providerId] ?? 'derived from backends'})`),
+    ]
+    this.attachList(
+      `Order ${providerId} · ${this.orderedProviders().indexOf(providerId) + 1} of ${this.orderedProviders().length}`,
+      'Enter applies · Esc goes back to the order list.',
+      items,
+      id => {
+        if (id === 'rank-up') {
+          this.moveProvider(providerId, -1)
+        } else if (id === 'rank-down') {
+          this.moveProvider(providerId, 1)
+        } else if (id === 'rank-front') {
+          this.moveProvider(providerId, 0)
+        } else if (id === 'rank-set') {
+          const current = this.draft!.providerPriority?.[providerId]
+          this.inputBackPage = { kind: 'provider-rank' }
+          this.inputInitial = current === undefined ? '' : String(current)
+          this.goTo({ kind: 'input', purpose: 'provider-rank' })
+          return
+        }
+        this.goTo({ kind: 'provider-order' })
+      },
+      () => this.goTo({ kind: 'provider-order' }),
+    )
+  }
+
   private buildBackendActions(): void {
     const backend = this.draft!.models[0]!.backends[this.activeBackendIndex]!
     const items: SettingItem[] = [
       this.menuItem('toggle', backend.enabled === false ? 'Enable' : 'Disable'),
+      this.menuItem('move-up', 'Move up (toward first)'),
+      this.menuItem('move-down', 'Move down (toward last)'),
+      this.menuItem('move-front', 'Move to front'),
       this.menuItem('weight', 'Set weight'),
       this.menuItem('max-concurrent',
         `Set max concurrent requests (now ${backend.maxConcurrent === undefined ? 'uncapped' : backend.maxConcurrent})`),
       this.menuItem('priority', `Set priority (lower runs first · now ${backend.priority ?? 0})`),
+      this.menuItem('position', `Order position: ${this.orderedBackendPosition()} of ${this.draft!.models[0]!.backends.length}`),
       this.menuItem('remove', 'Remove'),
     ]
     this.attachList(
@@ -620,6 +775,12 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = String(backend.weight ?? 1)
           this.goTo({ kind: 'input', purpose: 'weight' })
+        } else if (id === 'move-up') {
+          this.moveBackend(-1)
+        } else if (id === 'move-down') {
+          this.moveBackend(1)
+        } else if (id === 'move-front') {
+          this.moveBackend(0)
         } else if (id === 'max-concurrent') {
           this.inputBackPage = { kind: 'backend' }
           this.inputInitial = backend.maxConcurrent === undefined ? '' : String(backend.maxConcurrent)
@@ -645,6 +806,8 @@ class VirtualProviderEditorDialog extends Container {
       ? 'Virtual model id (shown in /model)'
       : purpose === 'reset-hour'
       ? 'Set reset hour (0-23, local time)'
+      : purpose === 'provider-rank'
+      ? `Provider rank for ${this.activeRankProvider ?? ''} (0 runs first)`
       : purpose === 'provider-limit'
       ? `Provider concurrency limit (${this.activeLimitProvider ?? ''}, per process; 0 clears)`
       : purpose === 'max-concurrent'
@@ -659,6 +822,8 @@ class VirtualProviderEditorDialog extends Container {
       ? this.applyConcurrencyInput(input.getValue())
       : purpose === 'provider-limit'
       ? this.applyProviderLimitInput(input.getValue())
+      : purpose === 'provider-rank'
+      ? this.applyProviderRankInput(input.getValue())
       : purpose === 'reset-hour'
       ? this.applyResetHourInput(input.getValue())
       : this.applyInput(purpose, input.getValue())
@@ -734,6 +899,29 @@ class VirtualProviderEditorDialog extends Container {
     }
     this.billingDraft.set(providerId, { ...policy, hour: parsed })
     this.goTo({ kind: 'menu' })
+  }
+
+  private applyProviderRankInput(raw: string): void {
+    const providerId = this.activeRankProvider
+    if (providerId === undefined) {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const parsed = Number(raw.trim())
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      this.pageError = 'Provider rank must be a whole number from 0 up.'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    // Materialize the visible order, then override the one entry being set, so
+    // a hand-picked rank never silently reorders its neighbours.
+    const order = this.orderedProviders()
+    const priorities: Record<string, number> = { ...(this.draft!.providerPriority ?? {}) }
+    order.forEach((other, position) => { priorities[other] = position })
+    priorities[providerId] = parsed
+    this.draft!.providerPriority = priorities
+    this.goTo({ kind: 'provider-rank' })
   }
 
   private applyProviderLimitInput(raw: string): void {
@@ -1683,6 +1871,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           groupLimits: groupLimitsFor([
             ...new Set(config.models.flatMap(model => model.backends.map(backend => backend.providerId))),
           ]),
+          groupPriorities: config.providerPriority ?? null,
           affinity: config.affinity !== false,
         })
       }

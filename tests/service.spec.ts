@@ -489,6 +489,79 @@ describe('two-level selection', () => {
     occupying.release({ status: 'success' })
   })
 
+  it('serves the first-ranked provider until it fails, then walks down the list', async () => {
+    const ranked = await groupedService({
+      providerStrategy: 'priority',
+      backends: [
+        { id: 'hc::flash', group: 'hc' },
+        { id: 'hc::air', group: 'hc' },
+        { id: 'oc::flash', group: 'oc' },
+        { id: 'cc::flash', group: 'cc' },
+      ],
+    })
+    await ranked.updatePool('virtual', { groupPriorities: { hc: 2, oc: 0, cc: 1 } })
+    // Priority does not rotate: while the first tier is healthy it keeps serving,
+    // even though hc::flash holds the same default backend priority as the rest.
+    expect(await picks(ranked, 3)).toEqual(['oc::flash', 'oc::flash', 'oc::flash'])
+
+    // oc runs out of credit: the 402 cools it, so the pool steps down to cc.
+    const failing = await ranked.acquire({ providerId: 'virtual' })
+    failing.release({ status: 'failure', error: failure(402) })
+    expect(await picks(ranked, 2)).toEqual(['cc::flash', 'cc::flash'])
+
+    // cc exhausts too, leaving only the last resort.
+    const second = await ranked.acquire({ providerId: 'virtual' })
+    second.release({ status: 'failure', error: failure(402) })
+    expect(await picks(ranked, 1)).toEqual(['hc::flash'])
+
+    // Recovering the first tier takes over again, no reordering required.
+    ranked.resetHealth('virtual', 'oc::flash')
+    expect(await picks(ranked, 1)).toEqual(['oc::flash'])
+    second.release({ status: 'success' })
+  })
+
+  it('shares load across providers deliberately tied at the same rank', async () => {
+    const tied = await groupedService({
+      providerStrategy: 'priority',
+      backends: [
+        { id: 'a::m1', group: 'a' },
+        { id: 'a::m2', group: 'a' },
+        { id: 'b::m1', group: 'b' },
+        { id: 'b::m2', group: 'b' },
+      ],
+    })
+    await tied.updatePool('virtual', { groupPriorities: { a: 0, b: 0 } })
+    const leases = []
+    for (let index = 0; index < 4; index += 1) leases.push(await held(tied))
+    const byGroup = leases.reduce<Record<string, number>>((totals, lease) => {
+      const group = lease.accountId.split('::')[0]!
+      totals[group] = (totals[group] ?? 0) + 1
+      return totals
+    }, {})
+    // Equal ranks mean equal load, not a hidden first-wins ordering.
+    expect(byGroup).toEqual({ a: 2, b: 2 })
+    for (const lease of leases) lease.release({ status: 'success' })
+  })
+
+  it('clears explicit provider ranks and falls back to the derived order', async () => {
+    const service = await groupedService({
+      providerStrategy: 'priority',
+      backends: [
+        { id: 'hc::flash', group: 'hc', priority: 5 },
+        { id: 'oc::flash', group: 'oc', priority: 1 },
+      ],
+    })
+    await service.updatePool('virtual', { groupPriorities: { hc: 0, oc: 1 } })
+    const first = await service.acquire({ providerId: 'virtual' })
+    expect(first.accountId).toBe('hc::flash')
+    first.release({ status: 'success' })
+    await service.updatePool('virtual', { groupPriorities: null })
+    // Derived from member priorities again: oc (1) now beats hc (5).
+    const second = await service.acquire({ providerId: 'virtual' })
+    expect(second.accountId).toBe('oc::flash')
+    second.release({ status: 'success' })
+  })
+
   it('honors a provider ceiling even when its models have headroom', async () => {
     // The case per-model caps cannot express: each hypercharm model could take
     // more work, but the provider itself is allowed only three at once.

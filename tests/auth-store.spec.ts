@@ -470,6 +470,38 @@ describe('MultiAuthStore virtual providers', () => {
     await expect(store.listProviderQuota()).rejects.toThrow(/malformed provider quota maxConcurrent/)
   })
 
+  it('persists explicit provider ranks and rejects malformed ones', async () => {
+    const { directory, store } = await storeFixture()
+    const saved = await store.saveVirtualProvider({
+      ...virtualConfig,
+      providerStrategy: 'priority',
+      providerPriority: { 'prov-b': 0, 'prov-a': 1 },
+    })
+    expect(saved.providerPriority).toEqual({ 'prov-b': 0, 'prov-a': 1 })
+    const raw = JSON.parse(await readFile(join(directory, 'multiprovider-auth.json'), 'utf8'))
+    expect(raw.virtuals.pooled.providerPriority).toEqual({ 'prov-b': 0, 'prov-a': 1 })
+    // Ranks may reference a provider that is not in the pool yet.
+    expect(await store.getVirtualProvider('pooled')).toMatchObject({
+      providerPriority: { 'prov-a': 1, 'prov-b': 0 },
+    })
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      providerPriority: { 'prov-a': -1 },
+    } as unknown as VirtualProviderConfig)).rejects.toThrow(/malformed provider priority "prov-a"/)
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      providerPriority: { 'prov-a': 'first' },
+    } as unknown as VirtualProviderConfig)).rejects.toThrow(/malformed provider priority "prov-a"/)
+    await expect(store.saveVirtualProvider({
+      ...virtualConfig,
+      providerPriority: 'prov-a',
+    } as unknown as VirtualProviderConfig)).rejects.toThrow(/malformed provider priority for virtual provider "pooled"/)
+    // An empty map is absent rather than stored, so clearing the order leaves
+    // the config byte-comparable with a pool that never ordered providers.
+    const cleared = await store.saveVirtualProvider({ ...virtualConfig, providerPriority: {} })
+    expect('providerPriority' in cleared).toBe(false)
+  })
+
   it('records a provider concurrency limit alongside its billing cycle', async () => {
     const { store } = await storeFixture()
     await store.setProviderBilling('hypercharm', { kind: 'daily' })
