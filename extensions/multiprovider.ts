@@ -145,7 +145,7 @@ type EditorPage =
   | { kind: 'provider-picker' }
   | { kind: 'model-picker' }
   | { kind: 'backend' }
-  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'reset-hour' }
+  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'max-concurrent' | 'reset-hour' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -166,6 +166,7 @@ class VirtualProviderEditorDialog extends Container {
   private readonly accountUsage: (providerId: string) => string | undefined
   private readonly flaggedLevels: (providerId: string, modelId: string) => string[]
   private readonly poolAttachments: (poolId: string) => AffinityEntry[]
+  private readonly backendLoad: (poolId: string, accountId: string) => string | undefined
   private readonly currentSessionKey: () => string
   private readonly clearProviderBlock: (providerId: string) => void
   private readonly pageContainer = new Container()
@@ -194,6 +195,7 @@ class VirtualProviderEditorDialog extends Container {
     accountUsage?: (providerId: string) => string | undefined
     flaggedLevels?: (providerId: string, modelId: string) => string[]
     poolAttachments?: (poolId: string) => AffinityEntry[]
+    backendLoad?: (poolId: string, accountId: string) => string | undefined
     currentSessionKey?: () => string
     clearProviderBlock?: (providerId: string) => void
     done: (outcome: VirtualEditorOutcome) => void
@@ -208,6 +210,7 @@ class VirtualProviderEditorDialog extends Container {
     this.accountUsage = options.accountUsage ?? (() => undefined)
     this.flaggedLevels = options.flaggedLevels ?? (() => [])
     this.poolAttachments = options.poolAttachments ?? (() => [])
+    this.backendLoad = options.backendLoad ?? (() => undefined)
     this.currentSessionKey = options.currentSessionKey ?? (() => '')
     this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
     this.done = options.done
@@ -342,6 +345,7 @@ class VirtualProviderEditorDialog extends Container {
   private buildMenu(): void {
     const model = this.draft!.models[0]!
     const strategy = this.draft!.strategy ?? 'round-robin'
+    const providerStrategy = this.draft!.providerStrategy
     const affinity = this.draft!.affinity !== false
     const billingProviders = [...new Set(
       model.backends.filter(backend => backend.enabled !== false).map(backend => backend.providerId),
@@ -351,7 +355,12 @@ class VirtualProviderEditorDialog extends Container {
     )
     const items: SettingItem[] = [
       this.menuItem('model-id', `Model id: ${model.id}`),
-      this.menuItem('strategy', `Strategy: ${strategy}`),
+      // Two levels when the operator wants them: the provider strategy spreads
+      // load across backing providers, then the model strategy picks inside the
+      // chosen one. Off keeps the pool on one flat pass over every backend.
+      this.menuItem('provider-strategy', `Provider strategy: ${providerStrategy ?? 'off (one flat pass)'}`),
+      this.menuItem('strategy', `Model strategy: ${strategy}`
+        + (providerStrategy === undefined ? ' · all backends' : ' · within provider')),
       this.menuItem('affinity', `Session affinity: ${affinity ? 'on (sticky per session)' : 'off (rotate)'}`),
       this.menuItem('add', 'Add backing provider model'),
       ...billingProviders.map(providerId => this.menuItem(
@@ -379,12 +388,12 @@ class VirtualProviderEditorDialog extends Container {
         const flags = this.flaggedLevels(backend.providerId, backend.modelId)
         const flagged = flags.length > 0
         const usage = this.accountUsage(backend.providerId)
+        const poolId = virtualSchedulerId(this.draft!.id, model.id)
+        const accountId = virtualBackendAccountId(backend)
         // Which sessions are on this backend, across every open pi process.
-        const attached = sessionsOn(
-          this.poolAttachments(virtualSchedulerId(this.draft!.id, model.id)),
-          virtualBackendAccountId(backend),
-          this.currentSessionKey(),
-        )
+        const attached = sessionsOn(this.poolAttachments(poolId), accountId, this.currentSessionKey())
+        // Live leases against this backend's concurrency cap, when known.
+        const load = this.backendLoad(poolId, accountId)
         return this.menuItem(
           `backend-${index}`,
           `${index + 1}. ${backend.providerId}`
@@ -393,6 +402,7 @@ class VirtualProviderEditorDialog extends Container {
               + (blocked ? ' · quota-blocked' : '')
               + (flagged ? ' · flagged(' + flags.join(',') + ')' : '')
               + (attached === undefined ? ' · no sessions' : ` · ${attached}`)
+              + (load === undefined ? '' : ` · ${load}`)
               + (usage === undefined ? '' : ` · ${usage}`)),
         )
       }),
@@ -409,6 +419,11 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = model.id
           this.goTo({ kind: 'input', purpose: 'model-id' })
+        } else if (id === 'provider-strategy') {
+          const next = nextProviderStrategy(this.draft!.providerStrategy)
+          if (next === 'off') delete this.draft!.providerStrategy
+          else this.draft!.providerStrategy = next
+          this.goTo({ kind: 'menu' })
         } else if (id === 'strategy') {
           // Cycle the persisted pool strategy; round-robin keeps the virtual
           // pool's unbiased rotation, the others map onto pool scheduling.
@@ -544,6 +559,8 @@ class VirtualProviderEditorDialog extends Container {
     const items: SettingItem[] = [
       this.menuItem('toggle', backend.enabled === false ? 'Enable' : 'Disable'),
       this.menuItem('weight', 'Set weight'),
+      this.menuItem('max-concurrent',
+        `Set max concurrent requests (now ${backend.maxConcurrent === undefined ? 'uncapped' : backend.maxConcurrent})`),
       this.menuItem('priority', `Set priority (lower runs first · now ${backend.priority ?? 0})`),
       this.menuItem('remove', 'Remove'),
     ]
@@ -558,6 +575,10 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = String(backend.weight ?? 1)
           this.goTo({ kind: 'input', purpose: 'weight' })
+        } else if (id === 'max-concurrent') {
+          this.inputBackPage = { kind: 'backend' }
+          this.inputInitial = backend.maxConcurrent === undefined ? '' : String(backend.maxConcurrent)
+          this.goTo({ kind: 'input', purpose: 'max-concurrent' })
         } else if (id === 'priority') {
           this.inputBackPage = { kind: 'backend' }
           this.inputInitial = String(backend.priority ?? 0)
@@ -579,12 +600,16 @@ class VirtualProviderEditorDialog extends Container {
       ? 'Virtual model id (shown in /model)'
       : purpose === 'reset-hour'
       ? 'Set reset hour (0-23, local time)'
+      : purpose === 'max-concurrent'
+      ? 'Set max concurrent requests (0 clears the cap)'
       : purpose === 'priority' ? 'Set priority (lower runs first)' : 'Set weight'
     this.addHeading(title, 'Enter confirms · Esc goes back.')
     const input = new Input()
     input.setValue(this.inputInitial)
     input.onSubmit = () => purpose === 'priority'
       ? this.applyPriorityInput(input.getValue())
+      : purpose === 'max-concurrent'
+      ? this.applyConcurrencyInput(input.getValue())
       : purpose === 'reset-hour'
       ? this.applyResetHourInput(input.getValue())
       : this.applyInput(purpose, input.getValue())
@@ -662,6 +687,32 @@ class VirtualProviderEditorDialog extends Container {
     this.goTo({ kind: 'menu' })
   }
 
+  private applyConcurrencyInput(raw: string): void {
+    const value = raw.trim()
+    const backend = this.draft!.models[0]!.backends[this.activeBackendIndex]
+    if (backend === undefined) {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    // Blank and 0 both mean "no cap": the limit is advisory, so clearing it
+    // never leaves a working backend unreachable.
+    if (value === '') {
+      delete backend.maxConcurrent
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const parsed = Number(value)
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      this.pageError = 'Max concurrent requests must be an integer (0 or blank clears the cap).'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    if (parsed === 0) delete backend.maxConcurrent
+    else backend.maxConcurrent = parsed
+    this.goTo({ kind: 'menu' })
+  }
+
   private applyPriorityInput(raw: string): void {
     const parsed = Number(raw.trim())
     const backend = this.draft!.models[0]!.backends[this.activeBackendIndex]
@@ -674,6 +725,23 @@ class VirtualProviderEditorDialog extends Container {
     backend.priority = parsed
     this.goTo({ kind: 'menu' })
   }
+}
+
+// Names what a pool actually runs: one strategy on a flat pool, both levels
+// once an operator picks a provider strategy, so a row never advertises a
+// strategy that is not the one selecting.
+function strategyLabel(pool: PublicPoolSnapshot): string {
+  return pool.groupPolicy === undefined ? pool.policy : `${pool.groupPolicy}+${pool.policy}`
+}
+
+// Cycles off, then every pool strategy, then back to off. `undefined` returns
+// as the literal string 'off' marker absent from the config, so a flat pool
+// stays byte-identical on disk.
+function nextProviderStrategy(
+  current: SelectionPolicy | undefined,
+): SelectionPolicy | 'off' {
+  const cycle: readonly (SelectionPolicy | undefined)[] = [undefined, ...SELECTION_POLICIES]
+  return cycle[(cycle.indexOf(current) + 1) % cycle.length] ?? 'off'
 }
 
 function isIntegration(value: unknown): value is AnyIntegration {
@@ -1098,6 +1166,31 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   // always included, so a cold cache degrades to this-process truth rather than
   // to nothing.
   const attachmentCache = new Map<string, AffinityEntry[]>()
+
+  // Backend load as of the last scheduler snapshot, for rows that cannot await
+  // one. A cold entry omits the load rather than showing a stale number.
+  const loadCache = new Map<string, { inFlight: number; maxConcurrent?: number }>()
+
+  const refreshLoadCache = async (): Promise<void> => {
+    const snapshot = await service.snapshot()
+    loadCache.clear()
+    for (const pool of snapshot.providers) {
+      for (const account of pool.accounts) {
+        loadCache.set(pool.id + VIRTUAL_ID_SEPARATOR + account.id, {
+          inFlight: account.inFlight,
+          ...(account.maxConcurrent === undefined ? {} : { maxConcurrent: account.maxConcurrent }),
+        })
+      }
+    }
+  }
+
+  const cachedLoad = (poolId: string, accountId: string): string | undefined => {
+    const entry = loadCache.get(poolId + VIRTUAL_ID_SEPARATOR + accountId)
+    if (entry === undefined) return undefined
+    return entry.maxConcurrent === undefined
+      ? `${entry.inFlight} in flight`
+      : `${entry.inFlight}/${entry.maxConcurrent} in flight`
+  }
 
   const refreshAttachmentCache = async (poolIds: readonly string[]): Promise<void> => {
     if (poolIds.length === 0) return
@@ -2091,8 +2184,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         } else {
           const pins = await attachmentView(poolId)
           const labels = [
-            `Automatic · let the ${pool.policy} strategy pick the next account`,
-            `Pick now · run the ${pool.policy} strategy and keep the result`,
+            `Automatic · let the ${strategyLabel(pool)} strategy pick the next account`,
+            `Pick now · run the ${strategyLabel(pool)} strategy and keep the result`,
             ...switchAccountLabels(switchable, currentId, accountId =>
               sessionsOn(pins, accountId, affinityKey)),
           ]
@@ -2148,7 +2241,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         await announceSwitch()
         const attached = sessionsOn(await attachmentView(poolId), pickedAccountId, affinityKey)
         ctx.ui.notify(
-          `multiprovider: the ${pool.policy} strategy picked ${pickedLabel} for this session`
+          `multiprovider: the ${strategyLabel(pool)} strategy picked ${pickedLabel} for this session`
             + ` (${attached ?? 'first session here'}).`,
           'info',
         )
@@ -2205,6 +2298,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       // report sessions from other processes rather than only this one.
       await refreshAttachmentCache(stored.flatMap(config =>
         config.models.map(model => virtualSchedulerId(config.id, model.id))))
+      await refreshLoadCache().catch(() => undefined)
       const ref = args.trim().toLowerCase()
       const existing = ref === '' ? undefined : stored.find(candidate => candidate.id.toLowerCase() === ref)
       const outcome = await ctx.ui.custom<VirtualEditorOutcome>(
@@ -2231,6 +2325,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           },
           flaggedLevels: (providerId, modelId) => flaggedLevelsFor(providerId, modelId),
           poolAttachments: cachedAttachments,
+          backendLoad: cachedLoad,
           currentSessionKey: () => currentContext?.sessionManager.getSessionId() ?? '',
           clearProviderBlock: providerId => {
             quotaBlocks.delete(providerId)

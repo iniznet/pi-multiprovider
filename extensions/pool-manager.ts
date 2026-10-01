@@ -80,11 +80,17 @@ function upstreamLabel(state: PoolManagerState): string {
 function upstreamSummary(state: PoolManagerState): string {
   if (!state.includeUpstream) return 'disabled'
   return `weight ${state.upstream.weight ?? 1} · priority ${state.upstream.priority ?? 0}`
+    + capSuffix(state.upstream.maxConcurrent)
 }
 
 function accountSummary(account: MultiAuthAccount): string {
   if (!account.enabled) return 'disabled'
-  return `weight ${account.weight} · priority ${account.priority}`
+  return `weight ${account.weight} · priority ${account.priority}` + capSuffix(account.maxConcurrent)
+}
+
+// A cap is the exception, so it only appears in the summary when one is set.
+function capSuffix(maxConcurrent: number | undefined): string {
+  return maxConcurrent === undefined ? '' : ` · cap ${maxConcurrent}`
 }
 
 function schedulerSummary(scheduler: SchedulerSettings): string {
@@ -95,9 +101,11 @@ function schedulerSummary(scheduler: SchedulerSettings): string {
   return `${formatMs(rateLimit)} rate-limit · ${formatMs(quota)} quota · ${formatMs(auth)} auth · ${errors} errors/switch`
 }
 
+type UpstreamField = 'label' | 'weight' | 'priority' | 'maxConcurrent'
+
 function mergeUpstream(
   current: MultiAuthUpstreamPreferences,
-  field: 'label' | 'weight' | 'priority',
+  field: UpstreamField,
   value: string,
 ): MultiAuthUpstreamPreferences {
   const next: MultiAuthUpstreamPreferences = { ...current }
@@ -109,10 +117,14 @@ function mergeUpstream(
     delete next.weight
     const parsed = Number(value)
     if (Number.isInteger(parsed) && parsed >= 1) next.weight = parsed
-  } else {
+  } else if (field === 'priority') {
     delete next.priority
     const parsed = Number(value)
     if (Number.isInteger(parsed) && parsed >= 0) next.priority = parsed
+  } else {
+    delete next.maxConcurrent
+    const parsed = Number(value)
+    if (Number.isInteger(parsed) && parsed >= 1) next.maxConcurrent = parsed
   }
   return next
 }
@@ -184,6 +196,9 @@ const WEIGHT_DESCRIPTION =
 const PRIORITY_DESCRIPTION =
   'Failover order under the priority strategy: smaller numbers run first (0 before 1), falling back only while a lower number cools down.'
 
+const CONCURRENCY_DESCRIPTION =
+  'Soft cap on how many requests this credential serves at once. Selection prefers accounts under the cap, then falls back to the least loaded when every account is at it. 0 means no cap.'
+
 function upstreamRow(
   theme: Theme,
   state: PoolManagerState,
@@ -217,6 +232,10 @@ function upstreamRow(
           setting('upstream.priority', 'Priority', String(state.upstream.priority ?? 0), {
             description: PRIORITY_DESCRIPTION,
             submenu: integerInputSubmenu(theme, 'Priority', PRIORITY_DESCRIPTION, 0),
+          }),
+          setting('upstream.maxConcurrent', 'Max concurrent', String(state.upstream.maxConcurrent ?? 0), {
+            description: CONCURRENCY_DESCRIPTION,
+            submenu: integerInputSubmenu(theme, 'Max concurrent', CONCURRENCY_DESCRIPTION, 0),
           }),
         ],
         persist,
@@ -293,6 +312,11 @@ function storedAccountRow(
         setting(`account.${account.id}.priority`, 'Priority', String(account.priority), {
           description: PRIORITY_DESCRIPTION,
           submenu: integerInputSubmenu(theme, 'Priority', PRIORITY_DESCRIPTION, 0),
+        }),
+        setting(`account.${account.id}.maxConcurrent`, 'Max concurrent',
+          String(account.maxConcurrent ?? 0), {
+          description: CONCURRENCY_DESCRIPTION,
+          submenu: integerInputSubmenu(theme, 'Max concurrent', CONCURRENCY_DESCRIPTION, 0),
         }),
         ...(methods.length === 0 ? [] : [reauthRow(theme, account, methods, persist)]),
         setting(`account.${account.id}.remove`, 'Remove account', '', {
@@ -544,8 +568,9 @@ export async function openPoolManager(
         await callbacks.updatePool({ includeUpstream: value === 'true' })
         return
       }
-      if (id === 'upstream.label' || id === 'upstream.weight' || id === 'upstream.priority') {
-        const field = id.slice('upstream.'.length) as 'label' | 'weight' | 'priority'
+      if (id === 'upstream.label' || id === 'upstream.weight'
+        || id === 'upstream.priority' || id === 'upstream.maxConcurrent') {
+        const field = id.slice('upstream.'.length) as UpstreamField
         await callbacks.updatePool({ upstream: mergeUpstream(lastState.upstream, field, value) })
         return
       }
@@ -558,7 +583,7 @@ export async function openPoolManager(
         )
         return
       }
-      const accountMatch = /^account\.([^.]+)\.(label|enabled|weight|priority|remove|reauth)$/.exec(id)
+      const accountMatch = /^account\.([^.]+)\.(label|enabled|weight|priority|maxConcurrent|remove|reauth)$/.exec(id)
       if (accountMatch === null) return
       const accountId = accountMatch[1]!
       const field = accountMatch[2]!
@@ -589,9 +614,11 @@ export async function openPoolManager(
         await callbacks.updateAccount(accountId, { enabled: value === 'true' })
         return
       }
-      if (field === 'weight' || field === 'priority') {
+      if (field === 'weight' || field === 'priority' || field === 'maxConcurrent') {
         const parsed = Number(value)
-        if (!Number.isInteger(parsed) || parsed < (field === 'weight' ? 1 : 0)) return
+        // A cap of 0 clears the limit; weight requires at least 1.
+        const floor = field === 'weight' ? 1 : 0
+        if (!Number.isInteger(parsed) || parsed < floor) return
         await callbacks.updateAccount(accountId, { [field]: parsed })
       }
     }

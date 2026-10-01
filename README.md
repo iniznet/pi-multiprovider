@@ -30,7 +30,7 @@ If an account fails before visible output, the lift can cool it down and retry a
 | :-: | --- | --- |
 | 🔐 | **Multiple credentials** | Store API keys and provider-native OAuth credentials per provider. |
 | 🪄 | **`/multilogin`** | Reuses Pi's searchable provider selector and login dialog, then opens a searchable settings-style pool manager for drilling into every row inline. |
-| 🔀 | **Four pool strategies** | Round robin, weighted round robin, least in flight, or priority failover. |
+| 🔀 | **Four pool strategies, two levels** | Round robin, weighted round robin, least in flight, or priority failover—applied to providers and again to models within one. |
 | 🔃 | **`/switch-account`** | Session pin to one pooled account for the current model—restored when the session is resumed; pool settings untouched. |
 | 🧬 | **Upstream merge** | Optionally treats Pi's normal `/login`, `auth.json`, environment, or ambient credential as another account—editable inline like any stored account. |
 | 🩺 | **Health-aware leases** | Tracks in-flight work, failures, cooldowns, session affinity, and retry exclusions. |
@@ -93,7 +93,7 @@ The flow:
 1. Searches providers and authentication methods exactly where Pi's `/login` UI does.
 2. Opens the pool manager, a settings view mirroring Pi's `/settings`: fuzzy search, inline value cycling, and drill-in submenus.
 3. The **Add account** row asks for a non-secret label and runs the provider's own login implementation—including pasting an API key for providers without an interactive flow—then returns to the manager.
-4. Every other row edits live settings: pool strategy and session affinity, an **Accounts** section grouping every pooled credential—**Pi default (upstream)** plus stored accounts—with per-account weight (traffic share) and priority (failover order), and scheduler cooldowns.
+4. Every other row edits live settings: pool strategy and session affinity, an **Accounts** section grouping every pooled credential—**Pi default (upstream)** plus stored accounts—with per-account weight (traffic share), priority (failover order), and max concurrent requests (a soft cap on simultaneous work), and scheduler cooldowns.
 
 Add as many accounts as you need from the same manager. Remove credentials from an account's submenu or with `/multilogout`; Pi's regular `/logout` and `auth.json` remain independent. **Reauthenticate** in a stored account's submenu re-runs the provider's own login flow and replaces that account's credential in place — label, weight, priority, and session pins stay, and the account's cooldown clears. Use it when a provider revokes or invalidates a refresh token (for example `refresh_token_invalidated`) instead of removing and re-adding the account.
 
@@ -116,6 +116,8 @@ Add as many accounts as you need from the same manager. Remove credentials from 
 | **Weighted round robin** | Uses smooth weighted scheduling. | Accounts with different quotas or spend limits. |
 | **Least in flight** | Selects the healthy account with the least active work. | Concurrent agents and uneven request duration. |
 | **Priority failover** | Uses the lowest-priority number until it becomes unhealthy. | Primary/backup credentials. |
+
+Any of the four can also run as the **provider strategy** of a virtual pool, deciding the backing provider first while the pool's own strategy picks the model inside it; see [Two-level selection](#two-level-selection-provider-strategy-and-model-strategy).
 
 First-account bias keeps every new session on the account listed first in the pool—**Pi default (upstream)** when included, otherwise the first stored account—so you stop seeing sessions start on a backup account while the main one has plenty of usage. Integrations that want even request rotation register with `selectionBias: 'none'`, which restores the classic rotate-through-healthy-accounts behavior: accounts rotate in pool order (the order they are configured, never re-sorted by id), the rotation starts at a random account so restarts do not favor the same one, and differing per-account weights share traffic smoothly instead of being ignored.
 
@@ -140,7 +142,7 @@ Scheduler affinity lives in memory, per process — so a picker in one terminal 
 - **Authority**: the local table always wins for its own session. A mirrored row can predate a switch this process just made, so merging never lets stale disk data override live state.
 - **Where it shows**: the `/switch-account` argument list and menu, and every backend row in `/vprovider`. A store read failure degrades those to this-process rows rather than blanking them.
 
-## Virtual providers## Virtual providers
+## Virtual providers
 
 A virtual provider maps **one model to multiple provider models**. Sessions are spread across the backing providers with unbiased round robin—no first-provider favoritism—while session affinity pins each session to one backend, so prompt caches stay warm between requests and every subscription sees roughly its share of sessions.
 
@@ -148,10 +150,34 @@ A virtual provider maps **one model to multiple provider models**. Sessions are 
 
 Each backend row also names who is on it — `this session`, `2 others`, or `no sessions` — counted across every open pi process, so you can see a pool collapsing onto one credential before you send anything.
 
+### Two-level selection: provider strategy and model strategy
+
+A backing provider limits concurrency **per model**, and one virtual pool routinely holds several models on the same provider. A single strategy over a flat backend list cannot express "spread across providers, then pick a model with headroom", so `/vprovider` exposes two:
+
+| Row | Decides | When off |
+| --- | --- | --- |
+| **Provider strategy** | which backing provider serves the request | `off (one flat pass)` — one strategy chooses among all backends, exactly as pools behaved before |
+| **Model strategy** | which model on that provider serves it | always active; when the provider strategy is off it governs the whole pool (`· all backends`) |
+
+Both accept the same four strategies. A provider is scored as the **sum** of its backends' weights, carries the **best** (lowest) priority among them, and its in-flight count is the sum across its backends — so a provider holding three backends takes three times the share of an equal-weight single backend under weighted round robin, and qualifies for a priority tier as soon as one of its models sits in it.
+
+**Concurrency caps.** Each backend takes a `Max concurrent requests` value (`0` or blank clears it). Selection prefers backends below their cap, and a provider drops out of stage one entirely only when *every* one of its models is at the cap:
+
+```
+hypercharm · glm-5.3-flash · enabled · w1 · this session · 2/2 in flight
+hypercharm · glm-5.3-flash-air · enabled · w1 · no sessions · 0/1 in flight
+opencode-go · glm-5.3-flash · enabled · w1 · no sessions · 1 in flight
+```
+
+- The cap is **advisory, never a refusal**. When every eligible backend is at its cap, the scheduler serves the least loaded one instead of failing: a fan-out of twenty agents against a cap of two degrades gracefully rather than dead-ending. Account pools' `Max concurrent` works the same way, including on the **Pi default** credential.
+- **An explicit pin outranks a cap.** `/switch-account` exists to override the scheduler, so a session pinned to a backend at its cap stays there; caps only steer *automatic* placement.
+- Model rotation state is tracked **per provider** once a provider strategy is set, so a provider does not get paired with the same model on every visit.
+- Session cache affinity is unchanged: the pin records the whole `(provider, model)` backend, and both stages only run when a session has no pin.
+
 Create one with `/vprovider`:
 
 1. Choose **Create new virtual provider**, then set the provider id and virtual model id.
-2. Add one or more **backing provider models**—pick any registered provider and one of its models from a fixed-height, type-to-filter list. Toggle, reweight, or remove backends at any time.
+2. Add one or more **backing provider models**—pick any registered provider and one of its models from a fixed-height, type-to-filter list. Toggle, reweight, set a concurrency cap, or remove backends at any time.
 3. **Save and apply**. The virtual model appears in `/model` under the virtual provider's id.
 
 Behavior details:
