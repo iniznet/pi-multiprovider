@@ -79,6 +79,20 @@ function normalizeCap(value: number | undefined): number | undefined {
   return cap >= 1 ? cap : undefined
 }
 
+// Same rule per group ceiling, with empty maps collapsed to absent so a pool
+// that never set a limit reads identically to one that cleared it later.
+function normalizeGroupLimits(
+  value: Record<string, number> | undefined,
+): Record<string, number> | undefined {
+  if (value === undefined) return undefined
+  const limits: Record<string, number> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    const cap = normalizeCap(entry)
+    if (cap !== undefined && key.trim() !== '') limits[key] = cap
+  }
+  return Object.keys(limits).length === 0 ? undefined : limits
+}
+
 // Plain round-robin prefers the first healthy account in pool order by
 // default so new sessions start on the operator's main account; register a
 // provider with selectionBias 'none' for even rotation instead.
@@ -243,7 +257,13 @@ export class MultiProviderService {
         selected = available.find(item => item.account.id === pinnedId)
       }
     }
-    selected ??= this.select(options.providerId, pool.policy, pool.groupPolicy, available)
+    selected ??= this.select(
+      options.providerId,
+      pool.policy,
+      pool.groupPolicy,
+      pool.groupLimits,
+      available,
+    )
 
     if (options.affinityKey !== undefined && pool.affinity && !explicitPin) {
       let table = this.affinity.get(options.providerId)
@@ -309,6 +329,7 @@ export class MultiProviderService {
         label: registration.label,
         policy: pool.policy,
         ...(pool.groupPolicy === undefined ? {} : { groupPolicy: pool.groupPolicy }),
+        ...(pool.groupLimits === undefined ? {} : { groupLimits: { ...pool.groupLimits } }),
         affinity: pool.affinity,
         firstAccountBias: (this.selectionBias.get(registration.id) ?? DEFAULT_SELECTION_BIAS) === 'first-account',
         ...(registration.managementHint === undefined
@@ -323,7 +344,7 @@ export class MultiProviderService {
   async updatePool(
     providerId: string,
     patch: Partial<Pick<PoolPreference, 'policy' | 'affinity' | 'accounts'>>
-      & { groupPolicy?: SelectionPolicy | null },
+      & { groupPolicy?: SelectionPolicy | null, groupLimits?: Record<string, number> | null },
   ): Promise<PublicPoolSnapshot> {
     this.registration(providerId)
     const current = this.pool(providerId)
@@ -332,10 +353,15 @@ export class MultiProviderService {
     const groupPolicy = patch.groupPolicy === null
       ? undefined
       : patch.groupPolicy ?? current.groupPolicy
+    // null clears every ceiling; an omitted key leaves them as configured.
+    const groupLimits = patch.groupLimits === null
+      ? undefined
+      : normalizeGroupLimits(patch.groupLimits ?? current.groupLimits)
     const next: PoolPreference = {
       providerId,
       policy: patch.policy ?? current.policy,
       ...(groupPolicy === undefined ? {} : { groupPolicy }),
+      ...(groupLimits === undefined ? {} : { groupLimits }),
       affinity: patch.affinity ?? current.affinity,
       accounts: (patch.accounts ?? current.accounts).map(account => ({ ...account })),
     }
@@ -516,15 +542,50 @@ export class MultiProviderService {
     providerId: string,
     policy: SelectionPolicy,
     groupPolicy: SelectionPolicy | undefined,
+    groupLimits: Record<string, number> | undefined,
     accounts: EffectiveAccount[],
   ): EffectiveAccount {
     // Two-level selection engages only when the operator chose a
     // provider-level strategy and the pool actually has groups; otherwise the
-    // pool keeps its single flat pass over accounts.
+    // pool keeps its single flat pass over accounts. Provider ceilings apply
+    // either way, because they filter candidates rather than order them.
+    const withinCeiling = this.withGroupHeadroom(accounts, groupLimits)
     if (groupPolicy !== undefined && accounts.some(item => item.group !== undefined)) {
-      return this.selectGrouped(providerId, policy, groupPolicy, accounts)
+      return this.selectGrouped(providerId, policy, groupPolicy, groupLimits, withinCeiling)
     }
-    return this.selectBy(providerId, providerId, policy, this.preferHeadroom(accounts))
+    return this.selectBy(providerId, providerId, policy, this.preferHeadroom(withinCeiling))
+  }
+
+  // A provider-wide ceiling filters eligibility the same way a per-account cap
+  // does, so it works on a flat pool too. Group load counts every eligible
+  // member including ones already at their own cap: a model that cannot take
+  // more work still holds the slots it has.
+  private withGroupHeadroom(
+    items: EffectiveAccount[],
+    limits: Record<string, number> | undefined,
+  ): EffectiveAccount[] {
+    if (limits === undefined) return items
+    const load = this.groupLoad(items)
+    const free = items.filter(item => {
+      const limit = limits[this.groupKey(item)]
+      return limit === undefined || (load.get(this.groupKey(item)) ?? 0) < limit
+    })
+    // Every ceiling reached: keep serving the least loaded account rather than
+    // refusing, so a limit is never a way to fail a turn.
+    return free.length > 0 ? free : [this.leastLoaded(items)]
+  }
+
+  private groupKey(item: EffectiveAccount): string {
+    return item.group ?? `account:${item.account.id}`
+  }
+
+  private groupLoad(items: EffectiveAccount[]): Map<string, number> {
+    const load = new Map<string, number>()
+    for (const item of items) {
+      const key = this.groupKey(item)
+      load.set(key, (load.get(key) ?? 0) + item.runtime.inFlight)
+    }
+    return load
   }
 
   // Accounts still below their soft cap, or the least loaded account when every
@@ -551,22 +612,25 @@ export class MultiProviderService {
     providerId: string,
     modelPolicy: SelectionPolicy,
     groupPolicy: SelectionPolicy,
+    groupLimits: Record<string, number> | undefined,
     accounts: EffectiveAccount[],
   ): EffectiveAccount {
     // Bucket order is first-appearance order, so both stages follow pool
     // (inventory) order the same way the flat path does.
     const buckets = new Map<string, EffectiveAccount[]>()
     for (const item of accounts) {
-      const key = item.group ?? `account:${item.account.id}`
-      const members = buckets.get(key)
-      if (members === undefined) buckets.set(key, [item])
+      const members = buckets.get(this.groupKey(item))
+      if (members === undefined) buckets.set(this.groupKey(item), [item])
       else members.push(item)
     }
-    // A group is selectable only while at least one of its models has headroom.
+    // A group is selectable while it is under its provider ceiling and at least
+    // one of its models still has headroom of its own.
     const live = new Map<string, EffectiveAccount[]>()
-    for (const [key, members] of buckets) {
-      const free = members.filter(item => !this.isCapped(item))
-      if (free.length > 0) live.set(key, free)
+    for (const group of this.groupAggregates(buckets)) {
+      const limit = groupLimits?.[group.key]
+      if (limit !== undefined && group.inFlight >= limit) continue
+      const free = buckets.get(group.key)!.filter(item => !this.isCapped(item))
+      if (free.length > 0) live.set(group.key, free)
     }
     if (live.size === 0) {
       return this.selectBy(providerId, providerId, modelPolicy, [this.leastLoaded(accounts)])

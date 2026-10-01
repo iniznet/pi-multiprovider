@@ -369,6 +369,7 @@ async function groupedService(
     backends?: GroupedBackend[]
     providerStrategy?: SelectionPolicy | null
     modelStrategy?: SelectionPolicy
+    groupLimits?: Record<string, number>
   } = {},
 ): Promise<MultiProviderService> {
   const service = new MultiProviderService({ randomInt: () => 0 })
@@ -391,6 +392,7 @@ async function groupedService(
     affinity: false,
     policy: options.modelStrategy ?? 'round-robin',
     groupPolicy: options.providerStrategy === undefined ? 'round-robin' : options.providerStrategy,
+    ...(options.groupLimits === undefined ? {} : { groupLimits: options.groupLimits }),
   })
   return service
 }
@@ -485,6 +487,74 @@ describe('two-level selection', () => {
     expect(pinned.accountId).toBe('p1::m1')
     pinned.release({ status: 'success' })
     occupying.release({ status: 'success' })
+  })
+
+  it('honors a provider ceiling even when its models have headroom', async () => {
+    // The case per-model caps cannot express: each hypercharm model could take
+    // more work, but the provider itself is allowed only three at once.
+    const service = await groupedService({
+      providerStrategy: 'priority',
+      modelStrategy: 'priority',
+      groupLimits: { hypercharm: 3 },
+      backends: [
+        { id: 'hypercharm::flash', group: 'hypercharm', priority: 0, maxConcurrent: 3 },
+        { id: 'hypercharm::air', group: 'hypercharm', priority: 0, maxConcurrent: 3 },
+        { id: 'opencode::flash', group: 'opencode', priority: 1 },
+      ],
+    })
+    const leases = []
+    for (let index = 0; index < 4; index += 1) leases.push(await held(service))
+    const onHypercharm = leases.filter(lease => lease.accountId.startsWith('hypercharm::'))
+    expect(onHypercharm).toHaveLength(3)
+    expect(leases[3]!.accountId).toBe('opencode::flash')
+    // Releasing one slot lets the preferred provider serve again.
+    leases[0]!.release({ status: 'success' })
+    const back = await held(service)
+    expect(back.accountId.startsWith('hypercharm::')).toBe(true)
+    for (const lease of [back, ...leases.slice(1)]) lease.release({ status: 'success' })
+  })
+
+  it('applies a provider ceiling on a flat pool with no provider strategy', async () => {
+    const service = await groupedService({
+      providerStrategy: null,
+      groupLimits: { p1: 1 },
+    })
+    const first = await held(service)
+    expect(first.accountId.startsWith('p1::')).toBe(true)
+    // p1 is at its ceiling, so its second model is skipped even though flat
+    // round robin would have walked straight onto it.
+    const second = await held(service)
+    expect(second.accountId.startsWith('p2::')).toBe(true)
+    first.release({ status: 'success' })
+    second.release({ status: 'success' })
+  })
+
+  it('fails open when every provider is at its ceiling', async () => {
+    const service = await groupedService({
+      groupLimits: { p1: 1, p2: 1 },
+    })
+    const held1 = await held(service)
+    const held2 = await held(service)
+    // Both providers are at their ceiling now. The pool keeps serving instead
+    // of refusing, and picks the least loaded backend rather than stacking onto
+    // a busy one, so a limit never turns into a failed turn.
+    const over = await held(service)
+    expect(over.accountId).not.toBe(held1.accountId)
+    expect(over.accountId).not.toBe(held2.accountId)
+    const pool = (await service.snapshot()).providers[0]!
+    expect(pool.accounts.find(account => account.id === over.accountId)!.inFlight).toBe(1)
+    over.release({ status: 'success' })
+    held1.release({ status: 'success' })
+    held2.release({ status: 'success' })
+  })
+
+  it('clears ceilings with null and drops values below one', async () => {
+    const service = await groupedService({ groupLimits: { p1: 2 } })
+    expect((await service.snapshot()).providers[0]!.groupLimits).toEqual({ p1: 2 })
+    await service.updatePool('virtual', { groupLimits: { p1: 0, p2: 1.7 } })
+    expect((await service.snapshot()).providers[0]!.groupLimits).toEqual({ p2: 1 })
+    await service.updatePool('virtual', { groupLimits: null })
+    expect('groupLimits' in (await service.snapshot()).providers[0]!).toBe(false)
   })
 
   it('weights a provider by the sum of its backend weights', async () => {

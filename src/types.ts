@@ -94,6 +94,13 @@ export interface PoolPreference {
    * selection behaves.
    */
   groupPolicy?: SelectionPolicy
+  /**
+   * Provider-wide ceiling on simultaneous leases, keyed by group (the backing
+   * provider id). A filter on eligibility rather than an ordering: it applies
+   * whether the pool runs two-level selection or one flat pass. Counts are
+   * per-process, so several pi processes on one pool each hold their own budget.
+   */
+  groupLimits?: Record<string, number>
   affinity: boolean
   accounts: AccountPreference[]
 }
@@ -190,6 +197,7 @@ export interface PublicPoolSnapshot {
   label: string
   policy: SelectionPolicy
   groupPolicy?: SelectionPolicy
+  groupLimits?: Record<string, number>
   affinity: boolean
   firstAccountBias: boolean
   managementHint?: string
