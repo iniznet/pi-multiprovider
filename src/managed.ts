@@ -209,6 +209,9 @@ export function createManagedIntegration<TApi extends Api>(
         credentialRef: PI_UPSTREAM_ACCOUNT_ID,
         weight: pool.upstream?.weight ?? 1,
         priority: pool.upstream?.priority ?? 0,
+        ...(pool.upstream?.maxConcurrent === undefined
+          ? {}
+          : { maxConcurrent: pool.upstream.maxConcurrent }),
         metadata: { source: 'auth.json, environment, or provider ambient auth' },
       })
     }
@@ -220,6 +223,7 @@ export function createManagedIntegration<TApi extends Api>(
       enabled: account.enabled,
       weight: account.weight,
       priority: account.priority,
+      ...(account.maxConcurrent === undefined ? {} : { maxConcurrent: account.maxConcurrent }),
       metadata: { stored: true },
     })))
     return result

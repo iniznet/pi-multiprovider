@@ -407,6 +407,49 @@ describe('MultiAuthStore virtual providers', () => {
       .toEqual(['accountId', 'explicit', 'label', 'updatedAt'])
   })
 
+  it('persists a provider strategy and per-backend concurrency caps', async () => {
+    const { store } = await storeFixture()
+    const saved = await store.saveVirtualProvider({
+      ...virtualConfig,
+      providerStrategy: 'weighted-round-robin',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'prov-a', modelId: 'model-a', weight: 2, maxConcurrent: 2 },
+          // 0 means "no cap": storing it would bench the backend outright.
+          { providerId: 'prov-b', modelId: 'model-b', weight: 1, maxConcurrent: 0 },
+        ],
+      }],
+    })
+    expect(saved.providerStrategy).toBe('weighted-round-robin')
+    expect(saved.models[0]!.backends[0]!.maxConcurrent).toBe(2)
+    expect('maxConcurrent' in saved.models[0]!.backends[1]!).toBe(false)
+    const listed = await store.listVirtualProviders()
+    expect(listed[0]!.providerStrategy).toBe('weighted-round-robin')
+    expect(listed[0]!.models[0]!.backends[0]!.maxConcurrent).toBe(2)
+  })
+
+  it('leaves providerStrategy absent until an operator chooses one', async () => {
+    const { directory, store } = await storeFixture()
+    const saved = await store.saveVirtualProvider(virtualConfig)
+    expect('providerStrategy' in saved).toBe(false)
+    const raw = JSON.parse(await readFile(join(directory, 'multiprovider-auth.json'), 'utf8'))
+    expect('providerStrategy' in raw.virtuals.pooled).toBe(false)
+    // A strategy outside the enum is a config error, not a silent fallback. The
+    // cast stands in for hand-edited JSON, which is where a bad value arrives.
+    await expect(store.saveVirtualProvider(
+      { ...virtualConfig, providerStrategy: 'fastest' } as unknown as VirtualProviderConfig,
+    )).rejects.toThrow('malformed strategy for virtual provider "pooled"')
+  })
+
+  it('stores an account concurrency cap and clears it with zero', async () => {
+    const { store } = await storeFixture()
+    const account = await store.addAccount('example', { label: 'Work', credential: { type: 'api_key', key: 'k' } })
+    expect('maxConcurrent' in account).toBe(false)
+    expect((await store.updateAccount('example', account.id, { maxConcurrent: 3 })).maxConcurrent).toBe(3)
+    expect('maxConcurrent' in await store.updateAccount('example', account.id, { maxConcurrent: 0 })).toBe(false)
+  })
+
   it('exposes one process\'s attachments to another through the shared file', async () => {
     // Two store instances over one path stand in for two terminal tabs: neither
     // shares memory with the other, so the file is the only cross-process view.

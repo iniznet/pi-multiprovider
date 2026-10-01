@@ -200,7 +200,7 @@ describe('managed account integration', () => {
     await store.addAccount(model.provider, {
       label: 'Extra',
       credential: { type: 'api_key', key: 'extra-key' },
-      pool: { upstream: { label: 'Team account', weight: 5, priority: 3 } },
+      pool: { upstream: { label: 'Team account', weight: 5, priority: 3, maxConcurrent: 2 } },
     })
     const provider = createProvider<'test-api'>({
       id: model.provider,
@@ -231,6 +231,7 @@ describe('managed account integration', () => {
       label: 'Team account',
       weight: 5,
       priority: 3,
+      maxConcurrent: 2,
     })
     expect(accounts[1]).toMatchObject({ label: 'Extra' })
 

@@ -42,6 +42,7 @@ export interface MultiAuthAccount {
   enabled: boolean
   weight: number
   priority: number
+  maxConcurrent?: number
   createdAt: string
   updatedAt: string
 }
@@ -50,6 +51,7 @@ export interface MultiAuthUpstreamPreferences {
   label?: string
   weight?: number
   priority?: number
+  maxConcurrent?: number
 }
 
 export interface MultiAuthPool {
@@ -82,6 +84,7 @@ export interface MultiAuthAccountSettings {
   enabled?: boolean
   weight?: number
   priority?: number
+  maxConcurrent?: number
 }
 
 interface PersistedAccount extends MultiAuthAccount {
@@ -174,7 +177,7 @@ function assertUpstreamPreferences(value: unknown): asserts value is MultiAuthUp
   if (candidate.label !== undefined && typeof candidate.label !== 'string') {
     throw new Error('multiprovider: malformed upstream label')
   }
-  for (const key of ['weight', 'priority'] as const) {
+  for (const key of ['weight', 'priority', 'maxConcurrent'] as const) {
     const entry = candidate[key]
     if (entry !== undefined && (typeof entry !== 'number' || !Number.isFinite(entry))) {
       throw new Error(`multiprovider: malformed upstream ${key}`)
@@ -312,12 +315,14 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
         `virtual model "${model.id}" backend "${backend.providerId}/${backend.modelId}"`,
       )
       const priority = normalizeBackendPriority(backend.priority)
+      const maxConcurrent = normalizeConcurrency(backend.maxConcurrent)
       return {
         providerId: backend.providerId,
         modelId: backend.modelId,
         ...(backend.enabled === undefined ? {} : { enabled: backend.enabled }),
         weight: normalizeWeight(backend.weight),
         ...(priority === 0 ? {} : { priority }),
+        ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
         ...(template === undefined ? {} : { template }),
       }
     })
@@ -328,6 +333,7 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
     }
   })
   const strategy = normalizeStrategy(candidate.strategy, candidate.id)
+  const providerStrategy = normalizeStrategy(candidate.providerStrategy, candidate.id)
   if (candidate.affinity !== undefined && typeof candidate.affinity !== 'boolean') {
     throw new Error(`multiprovider: malformed affinity for virtual provider "${candidate.id}"`)
   }
@@ -335,6 +341,9 @@ function normalizeVirtualProvider(value: unknown): VirtualProviderConfig {
     id: candidate.id,
     label: candidate.label.trim(),
     ...(strategy === undefined || strategy === 'round-robin' ? {} : { strategy }),
+    // Absent means one flat pass, so nothing is written until a provider-level
+    // strategy is actually chosen.
+    ...(providerStrategy === undefined ? {} : { providerStrategy }),
     // Affinity on is the default, so only an explicit opt-out is persisted.
     ...(candidate.affinity ? {} : candidate.affinity === false ? { affinity: false } : {}),
     models,
@@ -422,6 +431,14 @@ function normalizeWeight(value: number | undefined): number {
   return Number.isFinite(value) && (value ?? 0) > 0 ? Math.floor(value!) : 1
 }
 
+// A concurrency cap is optional: 0 or a malformed value means "no cap" rather
+// than "never serve", so a stray entry cannot bench a working backend.
+function normalizeConcurrency(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined
+  const cap = Math.floor(value)
+  return cap >= 1 ? cap : undefined
+}
+
 function normalizeBackendPriority(value: number | undefined): number {
   return Number.isFinite(value) && (value ?? 0) >= 0 ? Math.floor(value!) : 0
 }
@@ -446,6 +463,8 @@ export function normalizeUpstreamPreferences(
     const label = input.label.trim()
     if (label !== '') normalized.label = label
   }
+  const maxConcurrent = normalizeConcurrency(input.maxConcurrent)
+  if (maxConcurrent !== undefined) normalized.maxConcurrent = maxConcurrent
   if (input.weight !== undefined) normalized.weight = normalizeWeight(input.weight)
   if (input.priority !== undefined) normalized.priority = normalizePriority(input.priority, 0)
   return normalized
@@ -628,6 +647,11 @@ export class MultiAuthStore {
       if (settings.enabled !== undefined) account.enabled = settings.enabled
       if (settings.weight !== undefined) account.weight = normalizeWeight(settings.weight)
       if (settings.priority !== undefined) account.priority = normalizePriority(settings.priority, account.priority)
+      if (settings.maxConcurrent !== undefined) {
+        const cap = normalizeConcurrency(settings.maxConcurrent)
+        if (cap === undefined) delete account.maxConcurrent
+        else account.maxConcurrent = cap
+      }
       account.updatedAt = new Date().toISOString()
       return publicAccount(account)
     })

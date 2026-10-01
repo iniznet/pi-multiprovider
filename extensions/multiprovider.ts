@@ -1478,6 +1478,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
         // unbiased rotation, affinity off spreads a fan-out across backends.
         await service.updatePool(integration.id, {
           policy: config.strategy ?? 'round-robin',
+          // Absent keeps the pool on one flat pass; null clears a choice the
+          // operator later reverted.
+          groupPolicy: config.providerStrategy ?? null,
           affinity: config.affinity !== false,
         })
       }

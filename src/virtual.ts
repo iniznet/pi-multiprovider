@@ -165,6 +165,10 @@ export function createVirtualIntegrations(
           credentialRef: backend,
           weight: backend.weight ?? 1,
           priority: backend.priority ?? 0,
+          // Grouped by backing provider: a provider-level strategy spreads load
+          // across providers, then the model-level strategy picks inside one.
+          group: backend.providerId,
+          ...(backend.maxConcurrent === undefined ? {} : { maxConcurrent: backend.maxConcurrent }),
           metadata: { virtual: true, providerId: backend.providerId, modelId: backend.modelId },
         })),
     classifyFailure: (failure: ProviderAttemptFailure) => {

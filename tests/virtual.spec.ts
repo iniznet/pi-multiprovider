@@ -305,6 +305,49 @@ describe('virtual providers', () => {
       .toEqual(['prov-a::model-a', 'prov-b::model-b'])
   })
 
+  it('groups backends by provider and carries their concurrency caps', async () => {
+    const service = new MultiProviderService({ randomInt: () => 0 })
+    const grouped: VirtualProviderConfig = {
+      id: 'pooled',
+      label: 'Pooled',
+      providerStrategy: 'round-robin',
+      models: [{
+        id: 'ultra',
+        backends: [
+          { providerId: 'prov-a', modelId: 'model-a', maxConcurrent: 2 },
+          { providerId: 'prov-a', modelId: 'model-a-air' },
+          { providerId: 'prov-b', modelId: 'model-a' },
+        ],
+      }],
+    }
+    for (const integration of createVirtualIntegrations(grouped)) {
+      service.registerProvider(integration)
+    }
+    const poolId = virtualSchedulerId('pooled', 'ultra')
+    // Mirrors what reconcile applies from the config on every load or edit.
+    await service.updatePool(poolId, {
+      policy: grouped.strategy ?? 'round-robin',
+      groupPolicy: grouped.providerStrategy ?? null,
+      affinity: false,
+    })
+    const pool = (await service.snapshot()).providers[0]!
+    expect(pool.groupPolicy).toBe('round-robin')
+    expect(pool.accounts.map(account => account.group)).toEqual(['prov-a', 'prov-a', 'prov-b'])
+    expect(pool.accounts.map(account => account.maxConcurrent)).toEqual([2, undefined, undefined])
+
+    const seen: string[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const lease = await service.acquire({ providerId: poolId })
+      seen.push(lease.accountId)
+      lease.release({ status: 'success' })
+    }
+    // Provider level alternates; inside prov-a the model cursor advances on its
+    // own schedule, so a backend with no cap stays reachable.
+    expect(seen).toEqual([
+      'prov-a::model-a', 'prov-b::model-a', 'prov-a::model-a-air', 'prov-b::model-a',
+    ])
+  })
+
   it('exposes virtual models templated from the first healthy backend', () => {
     const { virtual } = harness({ a: () => okStream('x'), b: () => okStream('x') })
     const models = virtual.getModels()

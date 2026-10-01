@@ -261,6 +261,12 @@ export interface VirtualBackend {
   weight?: number
   /** Failover order under the priority strategy: smaller numbers run first. */
   priority?: number
+  /**
+   * Soft cap on how many requests this backing model serves at once. Providers
+   * commonly limit concurrency per model, so the cap belongs on the backend
+   * rather than on the pool that spans several of them.
+   */
+  maxConcurrent?: number
   template?: VirtualModelTemplate
 }
 
@@ -277,7 +283,15 @@ export interface VirtualModelConfig {
 export interface VirtualProviderConfig {
   id: string
   label: string
+  // Model-level strategy: which backend model serves once a provider is chosen
+  // (or across every backend at once, when providerStrategy is absent).
   strategy?: SelectionPolicy
+  /**
+   * Provider-level strategy for two-level selection. Absent keeps one flat pass
+   * over backends; set it to spread load across backing providers first, which
+   * is what a provider with a per-model concurrency limit needs.
+   */
+  providerStrategy?: SelectionPolicy
   // Session stickiness across this pool's backends. Default true, matching
   // account pools. Turn it off when a fan-out host (subagents, workflows)
   // should spread across backends instead of reusing one per session.
