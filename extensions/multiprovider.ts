@@ -135,7 +135,8 @@ class DynamicColumnSettingsList extends SettingsList {
 
 type VirtualEditorOutcome =
   | { kind: 'dismissed' }
-  | { kind: 'saved'; draft: VirtualProviderConfig; billing?: Record<string, BillingPolicy | undefined> }
+  | { kind: 'saved'; draft: VirtualProviderConfig; billing?: Record<string, BillingPolicy | undefined>
+      limits?: Record<string, number | undefined> }
   | { kind: 'discarded' }
   | { kind: 'removed'; id: string }
 
@@ -145,7 +146,8 @@ type EditorPage =
   | { kind: 'provider-picker' }
   | { kind: 'model-picker' }
   | { kind: 'backend' }
-  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'max-concurrent' | 'reset-hour' }
+  | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'max-concurrent'
+      | 'provider-limit' | 'reset-hour' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -161,7 +163,12 @@ class VirtualProviderEditorDialog extends Container {
   // Staged billing-marking edits (undefined value = marking off), persisted
   // with the save outcome so Save-and-apply stays the single commit point.
   private readonly billingDraft = new Map<string, BillingPolicy | undefined>()
+  // Staged provider concurrency limits, persisted with the save outcome the way
+  // billing markings are, so Save and apply stays the single commit point.
+  private readonly limitDraft = new Map<string, number | undefined>()
   private readonly providerBilling: (providerId: string) => BillingPolicy | undefined
+  private readonly providerLimit: (providerId: string) => number | undefined
+  private readonly providerLoad: (poolId: string, providerId: string) => string | undefined
   private readonly providerBlockUntil: (providerId: string) => number | undefined
   private readonly accountUsage: (providerId: string) => string | undefined
   private readonly flaggedLevels: (providerId: string, modelId: string) => string[]
@@ -179,6 +186,7 @@ class VirtualProviderEditorDialog extends Container {
   private activeBackendIndex = 0
   // Provider whose billing reset hour the input page is currently editing.
   private activeResetHourProvider: string | undefined
+  private activeLimitProvider: string | undefined
   private inputInitial = ''
   private pageError = ''
   private activeList: SettingsList | undefined
@@ -191,6 +199,8 @@ class VirtualProviderEditorDialog extends Container {
     isProviderIdAvailable: (id: string) => boolean
     startDraft: VirtualProviderConfig | undefined
     providerBilling?: (providerId: string) => BillingPolicy | undefined
+    providerLimit?: (providerId: string) => number | undefined
+    providerLoad?: (poolId: string, providerId: string) => string | undefined
     providerBlockUntil?: (providerId: string) => number | undefined
     accountUsage?: (providerId: string) => string | undefined
     flaggedLevels?: (providerId: string, modelId: string) => string[]
@@ -208,6 +218,8 @@ class VirtualProviderEditorDialog extends Container {
     this.providerBilling = options.providerBilling ?? (() => undefined)
     this.providerBlockUntil = options.providerBlockUntil ?? (() => undefined)
     this.accountUsage = options.accountUsage ?? (() => undefined)
+    this.providerLimit = options.providerLimit ?? (() => undefined)
+    this.providerLoad = options.providerLoad ?? (() => undefined)
     this.flaggedLevels = options.flaggedLevels ?? (() => [])
     this.poolAttachments = options.poolAttachments ?? (() => [])
     this.backendLoad = options.backendLoad ?? (() => undefined)
@@ -342,8 +354,22 @@ class VirtualProviderEditorDialog extends Container {
       : this.providerBilling(providerId)
   }
 
+  // A provider ceiling belongs to the provider, not to one model, so it is
+  // staged and persisted like the billing marking rather than inside the config.
+  private activeLimit(providerId: string): number | undefined {
+    return this.limitDraft.has(providerId)
+      ? this.limitDraft.get(providerId)
+      : this.providerLimit(providerId)
+  }
+
+  private limitLabel(providerId: string): string {
+    const limit = this.activeLimit(providerId)
+    return limit === undefined ? 'uncapped' : `${limit} concurrent per process`
+  }
+
   private buildMenu(): void {
     const model = this.draft!.models[0]!
+    const poolId = virtualSchedulerId(this.draft!.id, model.id)
     const strategy = this.draft!.strategy ?? 'round-robin'
     const providerStrategy = this.draft!.providerStrategy
     const affinity = this.draft!.affinity !== false
@@ -378,6 +404,15 @@ class VirtualProviderEditorDialog extends Container {
           'reset-hour-' + providerId,
           `Reset hour (${providerId}): ${String(this.activeBillingPolicy(providerId)!.hour ?? 0).padStart(2, '0')}:00`,
         )),
+      // The ceiling is shown with live load so an operator can see a provider
+      // filling up before sending the next request.
+      ...billingProviders.map(providerId => this.menuItem(
+        'limit-' + providerId,
+        `Limit (${providerId}): ${this.limitLabel(providerId)}`
+          + (this.providerLoad(poolId, providerId) === undefined
+            ? ''
+            : ` · ${this.providerLoad(poolId, providerId)}`),
+      )),
       ...blockedProviders.map(providerId => this.menuItem(
         'clear-quota-' + providerId,
         `Clear quota block (${providerId} · until ${new Date(this.providerBlockUntil(providerId)!).toLocaleTimeString()})`,
@@ -388,7 +423,6 @@ class VirtualProviderEditorDialog extends Container {
         const flags = this.flaggedLevels(backend.providerId, backend.modelId)
         const flagged = flags.length > 0
         const usage = this.accountUsage(backend.providerId)
-        const poolId = virtualSchedulerId(this.draft!.id, model.id)
         const accountId = virtualBackendAccountId(backend)
         // Which sessions are on this backend, across every open pi process.
         const attached = sessionsOn(this.poolAttachments(poolId), accountId, this.currentSessionKey())
@@ -455,6 +489,13 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = String(this.activeBillingPolicy(providerId)?.hour ?? 0)
           this.goTo({ kind: 'input', purpose: 'reset-hour' })
+        } else if (id.startsWith('limit-')) {
+          const providerId = id.slice('limit-'.length)
+          const limit = this.activeLimit(providerId)
+          this.activeLimitProvider = providerId
+          this.inputBackPage = { kind: 'menu' }
+          this.inputInitial = limit === undefined ? '' : String(limit)
+          this.goTo({ kind: 'input', purpose: 'provider-limit' })
         } else if (id.startsWith('clear-quota-')) {
           this.clearProviderBlock(id.slice('clear-quota-'.length))
           this.goTo({ kind: 'menu' })
@@ -480,10 +521,14 @@ class VirtualProviderEditorDialog extends Container {
           const stagedBilling = this.billingDraft.size === 0
             ? undefined
             : Object.fromEntries(this.billingDraft)
+          const stagedLimits = this.limitDraft.size === 0
+            ? undefined
+            : Object.fromEntries(this.limitDraft)
           this.done({
             kind: 'saved',
             draft: this.draft!,
             ...(stagedBilling === undefined ? {} : { billing: stagedBilling }),
+            ...(stagedLimits === undefined ? {} : { limits: stagedLimits }),
           })
         } else if (id === 'discard') {
           this.done({ kind: 'discarded' })
@@ -600,6 +645,8 @@ class VirtualProviderEditorDialog extends Container {
       ? 'Virtual model id (shown in /model)'
       : purpose === 'reset-hour'
       ? 'Set reset hour (0-23, local time)'
+      : purpose === 'provider-limit'
+      ? `Provider concurrency limit (${this.activeLimitProvider ?? ''}, per process; 0 clears)`
       : purpose === 'max-concurrent'
       ? 'Set max concurrent requests (0 clears the cap)'
       : purpose === 'priority' ? 'Set priority (lower runs first)' : 'Set weight'
@@ -610,6 +657,8 @@ class VirtualProviderEditorDialog extends Container {
       ? this.applyPriorityInput(input.getValue())
       : purpose === 'max-concurrent'
       ? this.applyConcurrencyInput(input.getValue())
+      : purpose === 'provider-limit'
+      ? this.applyProviderLimitInput(input.getValue())
       : purpose === 'reset-hour'
       ? this.applyResetHourInput(input.getValue())
       : this.applyInput(purpose, input.getValue())
@@ -684,6 +733,29 @@ class VirtualProviderEditorDialog extends Container {
       return
     }
     this.billingDraft.set(providerId, { ...policy, hour: parsed })
+    this.goTo({ kind: 'menu' })
+  }
+
+  private applyProviderLimitInput(raw: string): void {
+    const providerId = this.activeLimitProvider
+    if (providerId === undefined) {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const value = raw.trim()
+    if (value === '') {
+      this.limitDraft.set(providerId, undefined)
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const parsed = Number(value)
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      this.pageError = 'Provider limit must be a whole number (0 or blank clears the ceiling).'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    this.limitDraft.set(providerId, parsed === 0 ? undefined : parsed)
     this.goTo({ kind: 'menu' })
   }
 
@@ -874,16 +946,30 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   // Provider-level quota bookkeeping. Billing markings come from the store's
   // providerQuota section; active blocks survive restarts via the same section.
   const providerBilling = new Map<string, BillingPolicy>()
+  const providerLimits = new Map<string, number>()
   const quotaBlocks = new Map<string, { until: number; reason?: string }>()
   const flaggedBackends = new Set<string>()
   for (const [providerId, entry] of Object.entries(await store.listProviderQuota())) {
     if (entry.billing !== undefined) providerBilling.set(providerId, entry.billing)
+    if (entry.maxConcurrent !== undefined) providerLimits.set(providerId, entry.maxConcurrent)
     if (entry.blockedUntil !== undefined && entry.blockedUntil > Date.now()) {
       quotaBlocks.set(providerId, {
         until: entry.blockedUntil,
         ...(entry.reason === undefined ? {} : { reason: entry.reason }),
       })
     }
+  }
+
+  // Ceilings for a pool's groups, keyed by backing provider id. An empty set
+  // returns null, which clears whatever the pool held before, so removing a
+  // limit takes effect on the next reconcile instead of lasting until restart.
+  const groupLimitsFor = (providerIds: readonly string[]): Record<string, number> | null => {
+    const limits: Record<string, number> = {}
+    for (const providerId of providerIds) {
+      const limit = providerLimits.get(providerId)
+      if (limit !== undefined) limits[providerId] = limit
+    }
+    return Object.keys(limits).length === 0 ? null : limits
   }
 
   const isProviderQuotaBlocked = (providerId: string): boolean => {
@@ -1170,26 +1256,45 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
   // Backend load as of the last scheduler snapshot, for rows that cannot await
   // one. A cold entry omits the load rather than showing a stale number.
   const loadCache = new Map<string, { inFlight: number; maxConcurrent?: number }>()
+  const groupLoadCache = new Map<string, Map<string, { inFlight: number; limit?: number }>>()
 
   const refreshLoadCache = async (): Promise<void> => {
     const snapshot = await service.snapshot()
     loadCache.clear()
+    groupLoadCache.clear()
     for (const pool of snapshot.providers) {
+      const byGroup = new Map<string, { inFlight: number; limit?: number }>()
       for (const account of pool.accounts) {
         loadCache.set(pool.id + VIRTUAL_ID_SEPARATOR + account.id, {
           inFlight: account.inFlight,
           ...(account.maxConcurrent === undefined ? {} : { maxConcurrent: account.maxConcurrent }),
         })
+        if (account.group === undefined) continue
+        const group = byGroup.get(account.group) ?? { inFlight: 0 }
+        group.inFlight += account.inFlight
+        byGroup.set(account.group, group)
       }
+      for (const [key, limit] of Object.entries(pool.groupLimits ?? {})) {
+        const group = byGroup.get(key) ?? { inFlight: 0, limit }
+        group.limit = limit
+        byGroup.set(key, group)
+      }
+      groupLoadCache.set(pool.id, byGroup)
     }
   }
 
+  // A bare in-flight count says nothing without the ceiling it is measured
+  // against, so an uncapped backend shows no load column at all.
   const cachedLoad = (poolId: string, accountId: string): string | undefined => {
     const entry = loadCache.get(poolId + VIRTUAL_ID_SEPARATOR + accountId)
-    if (entry === undefined) return undefined
-    return entry.maxConcurrent === undefined
-      ? `${entry.inFlight} in flight`
-      : `${entry.inFlight}/${entry.maxConcurrent} in flight`
+    if (entry === undefined || entry.maxConcurrent === undefined) return undefined
+    return `${entry.inFlight}/${entry.maxConcurrent} in flight`
+  }
+
+  const cachedGroupLoad = (poolId: string, providerId: string): string | undefined => {
+    const entry = groupLoadCache.get(poolId)?.get(providerId)
+    if (entry === undefined || entry.limit === undefined) return undefined
+    return `${entry.inFlight}/${entry.limit} in flight`
   }
 
   const refreshAttachmentCache = async (poolIds: readonly string[]): Promise<void> => {
@@ -1451,6 +1556,7 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
       await service.updatePool(providerId, {
         policy: managedPool.policy,
         affinity: managedPool.affinity,
+        groupLimits: groupLimitsFor([providerId]),
       })
     }
 
@@ -1574,6 +1680,9 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           // Absent keeps the pool on one flat pass; null clears a choice the
           // operator later reverted.
           groupPolicy: config.providerStrategy ?? null,
+          groupLimits: groupLimitsFor([
+            ...new Set(config.models.flatMap(model => model.backends.map(backend => backend.providerId))),
+          ]),
           affinity: config.affinity !== false,
         })
       }
@@ -2309,6 +2418,8 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           isProviderIdAvailable: id => !virtualProviders.has(id) && ctx.modelRegistry.getProvider(id) === undefined,
           startDraft: existing === undefined ? undefined : structuredClone(existing),
           providerBilling: providerId => providerBilling.get(providerId),
+          providerLimit: providerId => providerLimits.get(providerId),
+          providerLoad: cachedGroupLoad,
           providerBlockUntil: providerId => quotaBlocks.get(providerId)?.until,
           accountUsage: providerId => {
             const snapshots = usageCache.snapshots(providerId)
@@ -2352,6 +2463,13 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           await store.setProviderBilling(providerId, policy)
           if (policy === undefined) providerBilling.delete(providerId)
           else providerBilling.set(providerId, policy)
+        }
+      }
+      if (outcome.limits !== undefined) {
+        for (const [providerId, limit] of Object.entries(outcome.limits)) {
+          await store.setProviderLimit(providerId, limit)
+          if (limit === undefined) providerLimits.delete(providerId)
+          else providerLimits.set(providerId, limit)
         }
       }
       await reconcile(ctx)

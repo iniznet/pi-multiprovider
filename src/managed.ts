@@ -209,6 +209,9 @@ export function createManagedIntegration<TApi extends Api>(
         credentialRef: PI_UPSTREAM_ACCOUNT_ID,
         weight: pool.upstream?.weight ?? 1,
         priority: pool.upstream?.priority ?? 0,
+        // Every credential in an account pool is on one provider, so the pool's
+        // single group is that provider and its ceiling bounds the whole pool.
+        group: provider.id,
         ...(pool.upstream?.maxConcurrent === undefined
           ? {}
           : { maxConcurrent: pool.upstream.maxConcurrent }),
@@ -223,6 +226,7 @@ export function createManagedIntegration<TApi extends Api>(
       enabled: account.enabled,
       weight: account.weight,
       priority: account.priority,
+      group: provider.id,
       ...(account.maxConcurrent === undefined ? {} : { maxConcurrent: account.maxConcurrent }),
       metadata: { stored: true },
     })))

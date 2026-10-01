@@ -1,4 +1,4 @@
-import { BILLING_RESET_KINDS, type BillingPolicy } from './types.ts'
+import { BILLING_RESET_KINDS, type BillingPolicy, type ProviderQuotaState } from './types.ts'
 
 const HOUR_MS = 3_600_000
 
@@ -96,22 +96,39 @@ export function normalizeBillingPolicy(value: unknown): BillingPolicy | undefine
     : { kind: candidate.kind, hour: candidate.hour }
 }
 
-export function normalizeProviderQuotaEntry(value: unknown): { billing?: BillingPolicy; blockedUntil?: number; reason?: string } {
+// One shape check per optional numeric field, so adding a field to a quota
+// entry composes a check instead of growing the validator's branching.
+function assertOptionalQuotaNumber(value: unknown, name: string): asserts value is number | undefined {
+  if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value))) {
+    throw new Error(`multiprovider: malformed provider quota ${name}`)
+  }
+}
+
+export function normalizeProviderQuotaEntry(value: unknown): ProviderQuotaState {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('multiprovider: malformed provider quota entry')
   }
-  const candidate = value as { billing?: unknown; blockedUntil?: unknown; reason?: unknown }
-  const billing = normalizeBillingPolicy(candidate.billing)
-  if (candidate.blockedUntil !== undefined
-    && (typeof candidate.blockedUntil !== 'number' || !Number.isFinite(candidate.blockedUntil))) {
-    throw new Error('multiprovider: malformed provider quota blockedUntil')
+  const candidate = value as {
+    billing?: unknown
+    blockedUntil?: unknown
+    reason?: unknown
+    maxConcurrent?: unknown
   }
+  const billing = normalizeBillingPolicy(candidate.billing)
+  assertOptionalQuotaNumber(candidate.blockedUntil, 'blockedUntil')
   if (candidate.reason !== undefined && typeof candidate.reason !== 'string') {
     throw new Error('multiprovider: malformed provider quota reason')
   }
+  assertOptionalQuotaNumber(candidate.maxConcurrent, 'maxConcurrent')
+  // A limit below one is the same as no limit: refusing it would bench the
+  // provider outright.
+  const maxConcurrent = typeof candidate.maxConcurrent === 'number' && candidate.maxConcurrent >= 1
+    ? Math.floor(candidate.maxConcurrent)
+    : undefined
   return {
     ...(billing === undefined ? {} : { billing }),
     ...(candidate.blockedUntil === undefined ? {} : { blockedUntil: candidate.blockedUntil }),
     ...(typeof candidate.reason === 'string' && candidate.reason !== '' ? { reason: candidate.reason } : {}),
+    ...(maxConcurrent === undefined ? {} : { maxConcurrent }),
   }
 }

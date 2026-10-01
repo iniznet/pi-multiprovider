@@ -103,6 +103,7 @@ interface PersistedProviderQuota {
   billing?: BillingPolicy
   blockedUntil?: number
   reason?: string
+  maxConcurrent?: number
 }
 
 interface PersistedState {
@@ -746,6 +747,32 @@ export class MultiAuthStore {
       const entry: PersistedProviderQuota = state.providerQuota[providerId]
         ?? (state.providerQuota[providerId] = {})
       entry.billing = normalized
+    })
+  }
+
+  /**
+   * Records the provider's own concurrency ceiling. Stored with the provider's
+   * billing cycle rather than inside a virtual config, because the limit is a
+   * fact about the provider that every pool using it must respect.
+   */
+  async setProviderLimit(providerId: string, maxConcurrent: number | undefined): Promise<void> {
+    assertSafeKey(providerId, 'provider id')
+    if (maxConcurrent !== undefined
+      && (!Number.isFinite(maxConcurrent) || Math.floor(maxConcurrent) < 1)) {
+      throw new Error('multiprovider: provider concurrency limit must be a whole number of at least 1')
+    }
+    await this.mutate(state => {
+      if (maxConcurrent === undefined) {
+        if (state.providerQuota?.[providerId] === undefined) return
+        delete state.providerQuota![providerId]!.maxConcurrent
+        if (Object.keys(state.providerQuota![providerId]!).length === 0) delete state.providerQuota![providerId]
+        if (Object.keys(state.providerQuota!).length === 0) delete state.providerQuota
+        return
+      }
+      state.providerQuota ??= {}
+      const entry: PersistedProviderQuota = state.providerQuota[providerId]
+        ?? (state.providerQuota[providerId] = {})
+      entry.maxConcurrent = Math.floor(maxConcurrent)
     })
   }
 

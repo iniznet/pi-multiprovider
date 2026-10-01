@@ -332,6 +332,12 @@ export interface ProviderQuotaState {
   billing?: BillingPolicy
   blockedUntil?: number
   reason?: string
+  /**
+   * The provider's own ceiling on simultaneous requests, across every model it
+   * serves. Marked on the provider rather than on a backend because it is a
+   * property of the account, not of one model. Counts are per pi process.
+   */
+  maxConcurrent?: number
 }
 
 export const SCHEDULER_SETTING_KEYS = [

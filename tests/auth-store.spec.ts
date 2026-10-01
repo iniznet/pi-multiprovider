@@ -442,6 +442,54 @@ describe('MultiAuthStore virtual providers', () => {
     )).rejects.toThrow('malformed strategy for virtual provider "pooled"')
   })
 
+  it('reads a hand-written provider ceiling and rejects a malformed one', async () => {
+    const { directory, store } = await storeFixture()
+    const file = join(directory, 'multiprovider-auth.json')
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      providers: {},
+      providerQuota: {
+        hypercharm: { billing: { kind: 'daily' }, maxConcurrent: 3 },
+        opencode: { maxConcurrent: 2.7 },
+        sleepy: { maxConcurrent: 0 },
+      },
+    }), 'utf8')
+    const quota = await store.listProviderQuota()
+    expect(quota.hypercharm?.maxConcurrent).toBe(3)
+    // The store mirrors the file; a pool applies the ceiling only after flooring
+    // it, and one below one means no ceiling (see two-level selection in
+    // service.spec). Writes are normalized here, so an edited file cannot make a
+    // provider permanently unservable.
+    expect(quota.opencode).toEqual({ maxConcurrent: 2.7 })
+    expect(quota.sleepy).toEqual({ maxConcurrent: 0 })
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      providers: {},
+      providerQuota: { hypercharm: { maxConcurrent: 'lots' } },
+    }), 'utf8')
+    await expect(store.listProviderQuota()).rejects.toThrow(/malformed provider quota maxConcurrent/)
+  })
+
+  it('records a provider concurrency limit alongside its billing cycle', async () => {
+    const { store } = await storeFixture()
+    await store.setProviderBilling('hypercharm', { kind: 'daily' })
+    await store.setProviderLimit('hypercharm', 3)
+    expect(await store.getProviderQuota('hypercharm')).toMatchObject({ maxConcurrent: 3 })
+    // Clearing the limit must leave the billing marking alone.
+    await store.setProviderLimit('hypercharm', undefined)
+    const cleared = await store.getProviderQuota('hypercharm')
+    expect(cleared).toBeDefined()
+    expect('maxConcurrent' in cleared!).toBe(false)
+    expect(cleared!.billing).toBeDefined()
+    // A limit below one is refused rather than silently benching the provider.
+    await expect(store.setProviderLimit('hypercharm', 0)).rejects.toThrow(/whole number of at least 1/)
+    // An entry holding only a limit is kept, and emptied entries disappear.
+    await store.setProviderLimit('opencode-go', 2)
+    expect((await store.listProviderQuota())['opencode-go']).toEqual({ maxConcurrent: 2 })
+    await store.setProviderLimit('opencode-go', undefined)
+    expect(await store.getProviderQuota('opencode-go')).toBeUndefined()
+  })
+
   it('stores an account concurrency cap and clears it with zero', async () => {
     const { store } = await storeFixture()
     const account = await store.addAccount('example', { label: 'Work', credential: { type: 'api_key', key: 'k' } })

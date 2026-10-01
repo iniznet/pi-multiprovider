@@ -232,8 +232,11 @@ describe('managed account integration', () => {
       weight: 5,
       priority: 3,
       maxConcurrent: 2,
+      // One group per account pool: every credential shares the same provider,
+      // so a provider ceiling bounds the pool as a whole.
+      group: model.provider,
     })
-    expect(accounts[1]).toMatchObject({ label: 'Extra' })
+    expect(accounts[1]).toMatchObject({ label: 'Extra', group: model.provider })
 
     await store.updatePool(model.provider, { upstream: {} })
     const defaulted = await integration.accounts()

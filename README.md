@@ -161,13 +161,38 @@ A backing provider limits concurrency **per model**, and one virtual pool routin
 
 Both accept the same four strategies. A provider is scored as the **sum** of its backends' weights, carries the **best** (lowest) priority among them, and its in-flight count is the sum across its backends — so a provider holding three backends takes three times the share of an equal-weight single backend under weighted round robin, and qualifies for a priority tier as soon as one of its models sits in it.
 
-**Concurrency caps.** Each backend takes a `Max concurrent requests` value (`0` or blank clears it). Selection prefers backends below their cap, and a provider drops out of stage one entirely only when *every* one of its models is at the cap:
+**Concurrency caps.** Each backend takes a `Max concurrent requests` value (`0` or blank clears it). Selection prefers backends below their cap, and a provider drops out of stage one entirely only when *every* one of its models is at the cap. A backend with no cap shows no load column, because a bare count has nothing to be measured against:
 
 ```
 hypercharm · glm-5.3-flash · enabled · w1 · this session · 2/2 in flight
 hypercharm · glm-5.3-flash-air · enabled · w1 · no sessions · 0/1 in flight
-opencode-go · glm-5.3-flash · enabled · w1 · no sessions · 1 in flight
+opencode-go · glm-5.3-flash · enabled · w1 · no sessions
 ```
+
+### Provider-wide ceilings
+
+Some providers limit concurrency across **every** model on the account, not per model. That limit cannot be expressed by capping each backend: five models capped at two still allow ten simultaneous requests where the provider permits three. So the ceiling is marked on the provider, in `/vprovider`:
+
+```
+Billing (hypercharm): daily · resets 00:00
+Limit (hypercharm): 3 concurrent per process · 2/3 in flight
+Limit (opencode-go): uncapped
+```
+
+It lives in `providerQuota` next to the billing cycle in `multiprovider-auth.json`, because it is a fact about the provider that every pool using it must respect — set it once and it bounds that provider inside each virtual pool and inside its account pool.
+
+The ceiling filters **eligibility**, exactly like a per-account cap, so it applies whether the pool runs two-level selection or one flat pass. Group load counts every eligible member on that provider, including models already at their own cap, because a model that cannot take more work still holds the slots it has. The two limits compose and the stricter one bites:
+
+| request | hypercharm in flight | served by |
+| --- | --- | --- |
+| 1 | 0/3 | `hypercharm/flash` (0/2) |
+| 2 | 1/3 | `hypercharm/air` (0/1) |
+| 3 | 2/3 | `hypercharm/flash` (1/2) |
+| 4 | **3/3** | `opencode-go/…` — every hypercharm model is below *its own* cap, yet the provider is full |
+
+Like the per-model cap, a ceiling is **advisory**: when every provider is at its ceiling, selection serves the least loaded backend rather than failing the turn.
+
+**Ceilings are per pi process.** The in-flight counter lives in one process's scheduler, so five tabs on the same pool each hold their own budget and the provider can see up to five times the ceiling. That is the right shape for a fan-out host — Fabric participants and workflow workers share one process, so one counter is accurate — and an approximation across separate terminals. True cross-process enforcement would need a shared reservation registry written on every acquire and release, with TTL sweep to reclaim slots from a process killed mid-stream; it costs a disk write per request and under-uses the provider during the reclaim window, so it is deliberately not built.
 
 - The cap is **advisory, never a refusal**. When every eligible backend is at its cap, the scheduler serves the least loaded one instead of failing: a fan-out of twenty agents against a cap of two degrades gracefully rather than dead-ending. Account pools' `Max concurrent` works the same way, including on the **Pi default** credential.
 - **An explicit pin outranks a cap.** `/switch-account` exists to override the scheduler, so a session pinned to a backend at its cap stays there; caps only steer *automatic* placement.
