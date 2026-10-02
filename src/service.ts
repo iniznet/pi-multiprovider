@@ -176,6 +176,11 @@ export class MultiProviderService {
   private readonly groupScores = new Map<string, Map<string, number>>()
   private readonly defaults: Required<Omit<SchedulerOptions, 'now' | 'randomId' | 'randomInt'>>
   private readonly now: () => number
+  // Floor for the next selection stamp. lastSelectedAt breaks ties for every
+  // strategy, and a wall clock offers millisecond resolution: two picks inside
+  // the same millisecond used to tie and silently fall back to list order,
+  // which read as a strategy ignoring its own rule during request bursts.
+  private lastSelectionAt = 0
   private readonly randomId: () => string
   private readonly randomInt: (maxExclusive: number) => number
 
@@ -284,7 +289,9 @@ export class MultiProviderService {
     }
 
     selected.runtime.inFlight += 1
-    selected.runtime.lastSelectedAt = now
+    const stampedAt = Math.max(now, this.lastSelectionAt + 1)
+    this.lastSelectionAt = stampedAt
+    selected.runtime.lastSelectedAt = stampedAt
     let released = false
     const account = selected.account as ProviderAccount<TCredentialRef>
 

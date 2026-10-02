@@ -370,9 +370,10 @@ async function groupedService(
     providerStrategy?: SelectionPolicy | null
     modelStrategy?: SelectionPolicy
     groupLimits?: Record<string, number>
+    now?: () => number
   } = {},
 ): Promise<MultiProviderService> {
-  const service = new MultiProviderService({ randomInt: () => 0 })
+  const service = new MultiProviderService({ randomInt: () => 0, ...(options.now === undefined ? {} : { now: options.now }) })
   service.registerProvider({
     id: 'virtual',
     label: 'Virtual',
@@ -518,6 +519,23 @@ describe('two-level selection', () => {
     ranked.resetHealth('virtual', 'oc::flash')
     expect(await picks(ranked, 1)).toEqual(['oc::flash'])
     second.release({ status: 'success' })
+  })
+
+  it('still rotates serialized picks when every pick lands in one millisecond', async () => {
+    // A fast tool loop can acquire and release faster than the clock ticks; the
+    // tie-break must stay strict instead of collapsing to inventory order.
+    const service = await groupedService({
+      providerStrategy: null,
+      modelStrategy: 'least-inflight',
+      now: () => 1_000,
+    })
+    const picks: string[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const lease = await service.acquire({ providerId: 'virtual' })
+      picks.push(lease.accountId)
+      lease.release({ status: 'success' })
+    }
+    expect(picks).toEqual(['p1::m1', 'p1::m2', 'p2::m1', 'p2::m2'])
   })
 
   it('shares load across providers deliberately tied at the same rank', async () => {
