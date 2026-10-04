@@ -149,7 +149,7 @@ type EditorPage =
   | { kind: 'provider-order' }
   | { kind: 'provider-rank' }
   | { kind: 'input'; purpose: 'provider-id' | 'model-id' | 'weight' | 'priority' | 'max-concurrent'
-      | 'provider-limit' | 'provider-rank' | 'reset-hour' }
+      | 'provider-limit' | 'provider-rank' | 'reset-hour' | 'suspend-hours' }
 
 // Single-host editor for the /vprovider flow, styled after the /model and
 // hide-providers selectors: every page (root menu, create inputs, editor
@@ -178,6 +178,7 @@ class VirtualProviderEditorDialog extends Container {
   private readonly backendLoad: (poolId: string, accountId: string) => string | undefined
   private readonly currentSessionKey: () => string
   private readonly clearProviderBlock: (providerId: string) => void
+  private readonly suspendProvider: ((providerId: string, until: number, reason: string) => void) | undefined
   private readonly pageContainer = new Container()
   private readonly listTheme: SettingsListTheme
   private draft: VirtualProviderConfig | undefined
@@ -190,6 +191,7 @@ class VirtualProviderEditorDialog extends Container {
   private activeResetHourProvider: string | undefined
   private activeLimitProvider: string | undefined
   private activeRankProvider: string | undefined
+  private activeSuspendProvider: string | undefined
   private inputInitial = ''
   private pageError = ''
   private activeList: SettingsList | undefined
@@ -211,6 +213,7 @@ class VirtualProviderEditorDialog extends Container {
     backendLoad?: (poolId: string, accountId: string) => string | undefined
     currentSessionKey?: () => string
     clearProviderBlock?: (providerId: string) => void
+    suspendProvider?: (providerId: string, until: number, reason: string) => void
     done: (outcome: VirtualEditorOutcome) => void
   }) {
     super()
@@ -228,6 +231,7 @@ class VirtualProviderEditorDialog extends Container {
     this.backendLoad = options.backendLoad ?? (() => undefined)
     this.currentSessionKey = options.currentSessionKey ?? (() => '')
     this.clearProviderBlock = options.clearProviderBlock ?? (() => undefined)
+    this.suspendProvider = options.suspendProvider
     this.done = options.done
     this.draft = options.startDraft
     this.page = options.startDraft === undefined ? { kind: 'root' } : { kind: 'menu' }
@@ -419,9 +423,24 @@ class VirtualProviderEditorDialog extends Container {
             ? ''
             : ` · ${this.providerLoad(poolId, providerId)}`),
       )),
+      // An operator who ran out early should not wait for the automatic block:
+      // suspending uses the same exclusion path as an automatic quota block,
+      // so the provider is skipped before any HTTP attempt and comes back on
+      // its own at the reset it is already marked with.
+      ...billingProviders
+        .filter(providerId => !blockedProviders.includes(providerId) && this.suspendProvider !== undefined)
+        .map(providerId => {
+          const policy = this.activeBillingPolicy(providerId)
+          const until = policy === undefined ? undefined : computeResetAt(policy, Date.now())
+          return this.menuItem(
+            'suspend-' + providerId,
+            `Suspend (${providerId})`
+              + (until === undefined ? '…' : ` until ${new Date(until).toLocaleTimeString()}`),
+          )
+        }),
       ...blockedProviders.map(providerId => this.menuItem(
         'clear-quota-' + providerId,
-        `Clear quota block (${providerId} · until ${new Date(this.providerBlockUntil(providerId)!).toLocaleTimeString()})`,
+        `Resume (${providerId}) · suspended until ${new Date(this.providerBlockUntil(providerId)!).toLocaleTimeString()}`,
       )),
       this.separatorItem('sep-top'),
       ...model.backends.map((backend, index) => {
@@ -504,6 +523,20 @@ class VirtualProviderEditorDialog extends Container {
           this.inputBackPage = { kind: 'menu' }
           this.inputInitial = limit === undefined ? '' : String(limit)
           this.goTo({ kind: 'input', purpose: 'provider-limit' })
+        } else if (id.startsWith('suspend-')) {
+          const providerId = id.slice('suspend-'.length)
+          const policy = this.activeBillingPolicy(providerId)
+          if (policy !== undefined) {
+            this.suspendProvider?.(providerId, computeResetAt(policy, Date.now()), 'suspended from /vprovider')
+            this.goTo({ kind: 'menu' })
+            return
+          }
+          // No billing cycle marked, so there is no reset time to aim at: ask
+          // how long to hold the provider out of rotation instead.
+          this.activeSuspendProvider = providerId
+          this.inputBackPage = { kind: 'menu' }
+          this.inputInitial = ''
+          this.goTo({ kind: 'input', purpose: 'suspend-hours' })
         } else if (id.startsWith('clear-quota-')) {
           this.clearProviderBlock(id.slice('clear-quota-'.length))
           this.goTo({ kind: 'menu' })
@@ -808,6 +841,8 @@ class VirtualProviderEditorDialog extends Container {
       ? 'Set reset hour (0-23, local time)'
       : purpose === 'provider-rank'
       ? `Provider rank for ${this.activeRankProvider ?? ''} (0 runs first)`
+      : purpose === 'suspend-hours'
+      ? `Suspend ${this.activeSuspendProvider ?? ''} for how many hours`
       : purpose === 'provider-limit'
       ? `Provider concurrency limit (${this.activeLimitProvider ?? ''}, per process; 0 clears)`
       : purpose === 'max-concurrent'
@@ -824,6 +859,8 @@ class VirtualProviderEditorDialog extends Container {
       ? this.applyProviderLimitInput(input.getValue())
       : purpose === 'provider-rank'
       ? this.applyProviderRankInput(input.getValue())
+      : purpose === 'suspend-hours'
+      ? this.applySuspendHoursInput(input.getValue())
       : purpose === 'reset-hour'
       ? this.applyResetHourInput(input.getValue())
       : this.applyInput(purpose, input.getValue())
@@ -898,6 +935,27 @@ class VirtualProviderEditorDialog extends Container {
       return
     }
     this.billingDraft.set(providerId, { ...policy, hour: parsed })
+    this.goTo({ kind: 'menu' })
+  }
+
+  private applySuspendHoursInput(raw: string): void {
+    const providerId = this.activeSuspendProvider
+    if (providerId === undefined) {
+      this.goTo({ kind: 'menu' })
+      return
+    }
+    const parsed = Number(raw.trim())
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      this.pageError = 'Suspend duration must be a whole number of hours, at least 1.'
+      this.inputInitial = raw
+      this.enterPage()
+      return
+    }
+    this.suspendProvider?.(
+      providerId,
+      Date.now() + parsed * 3_600_000,
+      `suspended ${parsed}h from /vprovider`,
+    )
     this.goTo({ kind: 'menu' })
   }
 
@@ -2630,6 +2688,15 @@ export default async function multiprovider(pi: ExtensionAPI): Promise<void> {
           clearProviderBlock: providerId => {
             quotaBlocks.delete(providerId)
             void store.clearProviderBlock(providerId).catch(() => undefined)
+            currentContext?.ui.notify(`multiprovider: "${providerId}" is back in rotation`, 'info')
+          },
+          suspendProvider: (providerId, until, reason) => {
+            quotaBlocks.set(providerId, { until, reason })
+            void store.blockProvider(providerId, until, reason).catch(() => undefined)
+            currentContext?.ui.notify(
+              `multiprovider: "${providerId}" suspended by hand until ${new Date(until).toLocaleString()}`,
+              'warning',
+            )
           },
           done,
         }),

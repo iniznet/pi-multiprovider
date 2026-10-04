@@ -161,6 +161,21 @@ A backing provider limits concurrency **per model**, and one virtual pool routin
 
 Both accept the same four strategies. A provider is scored as the **sum** of its backends' weights, and its in-flight count is the sum across its backends — so a provider holding three backends takes three times the share of an equal-weight single backend under weighted round robin.
 
+### Manual suspension
+
+Ran out of credits hours before the reset? Pull the whole provider out of rotation by hand instead of letting requests fail and cool one model at a time. `Suspend (hypercharm) until 07:00` sits next to the billing and ceiling rows in `/vprovider`:
+
+```
+Billing (hypercharm): daily · resets 07:00
+Limit (hypercharm): 3 concurrent per process · 2/3 in flight
+Suspend (hypercharm) until 07:00
+Resume (commandcode) · suspended until 11:30
+```
+
+- With a billing cycle marked, the provider suspends until that cycle's next reset — the same `computeResetAt` the automatic quota block uses, so a hand suspend and an automatic block always agree on when traffic returns.
+- With no billing cycle marked, the editor asks for a number of hours instead.
+- Suspension is a provider quota block: persisted, so it survives a restart; skips every model on that provider **before** any HTTP attempt (a session pinned into it fails over too); expires by itself at the deadline. `Resume` lifts it early. Neither touches the billing marking.
+
 ### Ordering: which provider runs first
 
 Choosing **Priority** as the provider strategy means *primary, then backup, then last resort*. What decides the order is **not** the backend list — it is the provider's rank:
