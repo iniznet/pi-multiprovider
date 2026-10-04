@@ -195,6 +195,10 @@ class VirtualProviderEditorDialog extends Container {
   private inputInitial = ''
   private pageError = ''
   private activeList: SettingsList | undefined
+  // Last row the operator activated, per page. Every action rebuilds the page
+  // from scratch, and a fresh list starts at the first row — without this the
+  // cursor teleports to the top after each keystroke of work.
+  private readonly lastSelectedByPage = new Map<string, string>()
   private activeInput: Input | undefined
 
   constructor(options: {
@@ -294,15 +298,23 @@ class VirtualProviderEditorDialog extends Container {
     onCancel: () => void,
   ): void {
     this.addHeading(title, description)
-    this.activeList = new DynamicColumnSettingsList(
+    const list = new DynamicColumnSettingsList(
       items,
       10,
       this.listTheme,
-      id => onSelect(id),
+      id => {
+        this.lastSelectedByPage.set(this.page.kind, id)
+        onSelect(id)
+      },
       onCancel,
       { enableSearch: true },
     )
-    this.pageContainer.addChild(this.activeList)
+    // Restore the cursor before the operator sees the rebuilt page. Rows are
+    // matched by id, so a row that moved (or vanished) does not misdirect it.
+    const remembered = this.lastSelectedByPage.get(this.page.kind)
+    if (remembered !== undefined) list.selectItem(remembered)
+    this.activeList = list
+    this.pageContainer.addChild(list)
   }
 
   private menuItem(id: string, label: string): SettingItem {
@@ -693,6 +705,10 @@ class VirtualProviderEditorDialog extends Container {
     ranked.splice(to, 0, backends[this.activeBackendIndex]!)
     ranked.forEach((backend, position) => { backend.priority = position })
     this.activeBackendIndex = to
+    // The menu row for this backend is index-based; keep the remembered menu
+    // cursor on the row that moved rather than on whichever backend now sits
+    // at the old index.
+    this.lastSelectedByPage.set('menu', 'backend-' + to)
   }
 
   private orderedBackendPosition(): number {
@@ -776,8 +792,10 @@ class VirtualProviderEditorDialog extends Container {
           this.inputInitial = current === undefined ? '' : String(current)
           this.goTo({ kind: 'input', purpose: 'provider-rank' })
           return
-        }
-        this.goTo({ kind: 'provider-order' })
+        } else return
+        // Stay on the actions page: the header position updates in place, and
+        // Esc still shows the whole reordered list one step away.
+        this.goTo({ kind: 'provider-rank' })
       },
       () => this.goTo({ kind: 'provider-order' }),
     )
@@ -805,7 +823,7 @@ class VirtualProviderEditorDialog extends Container {
         if (id === 'toggle') {
           backend.enabled = backend.enabled === false
         } else if (id === 'weight') {
-          this.inputBackPage = { kind: 'menu' }
+          this.inputBackPage = { kind: 'backend' }
           this.inputInitial = String(backend.weight ?? 1)
           this.goTo({ kind: 'input', purpose: 'weight' })
         } else if (id === 'move-up') {
@@ -824,8 +842,12 @@ class VirtualProviderEditorDialog extends Container {
           this.goTo({ kind: 'input', purpose: 'priority' })
         } else if (id === 'remove') {
           this.draft!.models[0]!.backends.splice(this.activeBackendIndex, 1)
+          this.goTo({ kind: 'menu' })
+          return
         } else return
-        this.goTo({ kind: 'menu' })
+        // Toggle and the three moves re-enter this page: the operator is
+        // working through this backend's actions, not done with it.
+        this.goTo({ kind: 'backend' })
       },
       () => this.goTo({ kind: 'menu' }),
     )
